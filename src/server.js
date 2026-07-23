@@ -1,23 +1,41 @@
 // ===== DURABLE OBJECT =====
 export class GameRoom {
-  constructor(state, env) {
-    this.state = state;
+  constructor(ctx, env) {  // <-- изменили параметры
+    this.ctx = ctx;
+    this.env = env;
+    this.storage = ctx.storage;  // <-- добавляем storage
     this.players = {};
     this.objects = [];
-    this.id = state.id.toString();
+    this.id = ctx.id.toString();
     this.tickInterval = null;
     
-    // Создаём несколько кубов на карте
-    for (let i = 0; i < 20; i++) {
-      this.objects.push({
-        id: i,
-        x: (Math.random() - 0.5) * 40,
-        z: (Math.random() - 0.5) * 40,
-        y: 1,
-        w: 2,
-        h: 2,
-        d: 2,
-        color: Math.floor(Math.random() * 0xffffff)
+    // Восстанавливаем состояние из storage
+    this.initialize();
+  }
+
+  async initialize() {
+    // Загружаем сохранённое состояние
+    const saved = await this.storage.get('state');
+    if (saved) {
+      this.players = saved.players || {};
+      this.objects = saved.objects || [];
+    } else {
+      // Создаём объекты только если нет сохранённого состояния
+      for (let i = 0; i < 20; i++) {
+        this.objects.push({
+          id: i,
+          x: (Math.random() - 0.5) * 40,
+          z: (Math.random() - 0.5) * 40,
+          y: 1,
+          w: 2,
+          h: 2,
+          d: 2,
+          color: Math.floor(Math.random() * 0xffffff)
+        });
+      }
+      await this.storage.put('state', {
+        players: this.players,
+        objects: this.objects
       });
     }
   }
@@ -25,14 +43,13 @@ export class GameRoom {
   async fetch(request) {
     const url = new URL(request.url);
     
-    // WebSocket upgrade
     if (url.pathname === '/ws') {
       const pair = new WebSocketPair();
       const [client, server] = Object.values(pair);
       
-      this.state.acceptWebSocket(server);
+      // Для SQLite DO используем this.ctx.acceptWebSocket
+      this.ctx.acceptWebSocket(server);
       
-      // Добавляем игрока
       const playerId = crypto.randomUUID();
       this.players[playerId] = {
         id: playerId,
@@ -43,9 +60,14 @@ export class GameRoom {
         health: 100
       };
       
+      // Сохраняем состояние
+      await this.storage.put('state', {
+        players: this.players,
+        objects: this.objects
+      });
+      
       server.serializeAttachment({ playerId });
       
-      // Отправляем текущее состояние новому игроку
       server.send(JSON.stringify({
         type: 'init',
         playerId,
@@ -53,9 +75,8 @@ export class GameRoom {
         objects: this.objects
       }));
       
-      // Запускаем игровой тик (если ещё не запущен)
       if (!this.tickInterval) {
-        this.tickInterval = setInterval(() => this.gameTick(), 50); // 20 FPS
+        this.tickInterval = setInterval(() => this.gameTick(), 50);
       }
       
       return new Response(null, { status: 101, webSocket: client });
@@ -64,7 +85,6 @@ export class GameRoom {
     return new Response('Not found', { status: 404 });
   }
 
-  // Обработка сообщений от клиента
   async webSocketMessage(ws, message) {
     const data = JSON.parse(message);
     const attachment = ws.deserializeAttachment();
@@ -76,10 +96,8 @@ export class GameRoom {
     
     switch(data.type) {
       case 'move':
-        // Поворот
         player.rotation = data.rotation || 0;
         
-        // Движение
         if (data.keys) {
           const speed = 0.15;
           let dx = 0, dz = 0;
@@ -91,14 +109,12 @@ export class GameRoom {
           player.x += dx;
           player.z += dz;
           
-          // Границы карты
           player.x = Math.max(-30, Math.min(30, player.x));
           player.z = Math.max(-30, Math.min(30, player.z));
         }
         break;
         
       case 'shoot':
-        // Простая стрельба: проверяем попадание по кубам
         const rayX = player.x + Math.sin(player.rotation) * 3;
         const rayZ = player.z + Math.cos(player.rotation) * 3;
         
@@ -106,15 +122,20 @@ export class GameRoom {
           const dx = obj.x - rayX;
           const dz = obj.z - rayZ;
           if (Math.abs(dx) < 2 && Math.abs(dz) < 2 && obj.h > 0) {
-            return { ...obj, h: obj.h - 0.5 }; // Уменьшаем высоту куба
+            return { ...obj, h: obj.h - 0.5 };
           }
           return obj;
         });
         break;
     }
+    
+    // Сохраняем состояние после каждого изменения
+    await this.storage.put('state', {
+      players: this.players,
+      objects: this.objects
+    });
   }
 
-  // Игровой тик - рассылаем состояние всем
   gameTick() {
     const state = {
       type: 'state',
@@ -123,7 +144,7 @@ export class GameRoom {
     };
     
     const message = JSON.stringify(state);
-    this.state.getWebSockets().forEach(ws => {
+    this.ctx.getWebSockets().forEach(ws => {
       try {
         ws.send(message);
       } catch(e) {}
@@ -134,9 +155,14 @@ export class GameRoom {
     const attachment = ws.deserializeAttachment();
     if (attachment?.playerId) {
       delete this.players[attachment.playerId];
+      
+      // Сохраняем состояние после удаления игрока
+      this.storage.put('state', {
+        players: this.players,
+        objects: this.objects
+      });
     }
     
-    // Если игроков нет - останавливаем тик
     if (Object.keys(this.players).length === 0) {
       clearInterval(this.tickInterval);
       this.tickInterval = null;
@@ -149,11 +175,9 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     
-    // Создаём/получаем комнату
     const id = env.GAME_ROOM.idFromName('main');
     const room = env.GAME_ROOM.get(id);
     
-    // Проксируем запрос в DO
     return room.fetch(request);
   }
 };
