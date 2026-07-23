@@ -1,26 +1,28 @@
 // ===== DURABLE OBJECT =====
 export class GameRoom {
-  constructor(ctx, env) {  // <-- изменили параметры
+  constructor(ctx, env) {
     this.ctx = ctx;
     this.env = env;
-    this.storage = ctx.storage;  // <-- добавляем storage
+    this.storage = ctx.storage;
     this.players = {};
     this.objects = [];
     this.id = ctx.id.toString();
     this.tickInterval = null;
     
-    // Восстанавливаем состояние из storage
+    // Счетчик TPS
+    this.tickCount = 0;
+    this.lastTickTime = Date.now();
+    this.currentTPS = 0;
+    
     this.initialize();
   }
 
   async initialize() {
-    // Загружаем сохранённое состояние
     const saved = await this.storage.get('state');
     if (saved) {
       this.players = saved.players || {};
       this.objects = saved.objects || [];
     } else {
-      // Создаём объекты только если нет сохранённого состояния
       for (let i = 0; i < 20; i++) {
         this.objects.push({
           id: i,
@@ -47,7 +49,6 @@ export class GameRoom {
       const pair = new WebSocketPair();
       const [client, server] = Object.values(pair);
       
-      // Для SQLite DO используем this.ctx.acceptWebSocket
       this.ctx.acceptWebSocket(server);
       
       const playerId = crypto.randomUUID();
@@ -60,7 +61,6 @@ export class GameRoom {
         health: 100
       };
       
-      // Сохраняем состояние
       await this.storage.put('state', {
         players: this.players,
         objects: this.objects
@@ -72,14 +72,27 @@ export class GameRoom {
         type: 'init',
         playerId,
         players: this.players,
-        objects: this.objects
+        objects: this.objects,
+        tps: 20 // Начальный TPS
       }));
       
       if (!this.tickInterval) {
         this.tickInterval = setInterval(() => this.gameTick(), 50);
+        this.lastTickTime = Date.now();
+        this.tickCount = 0;
       }
       
       return new Response(null, { status: 101, webSocket: client });
+    }
+    
+    if (url.pathname === '/stats') {
+      return new Response(JSON.stringify({
+        tps: this.currentTPS,
+        players: Object.keys(this.players).length,
+        objects: this.objects.length
+      }), {
+        headers: { 'Content-Type': 'application/json' }
+      });
     }
     
     return new Response('Not found', { status: 404 });
@@ -129,7 +142,6 @@ export class GameRoom {
         break;
     }
     
-    // Сохраняем состояние после каждого изменения
     await this.storage.put('state', {
       players: this.players,
       objects: this.objects
@@ -137,10 +149,22 @@ export class GameRoom {
   }
 
   gameTick() {
+    // Обновляем счетчик TPS
+    this.tickCount++;
+    const now = Date.now();
+    const elapsed = (now - this.lastTickTime) / 1000;
+    
+    if (elapsed >= 1) {
+      this.currentTPS = Math.round(this.tickCount / elapsed);
+      this.tickCount = 0;
+      this.lastTickTime = now;
+    }
+    
     const state = {
       type: 'state',
       players: this.players,
-      objects: this.objects
+      objects: this.objects,
+      tps: this.currentTPS
     };
     
     const message = JSON.stringify(state);
@@ -156,7 +180,6 @@ export class GameRoom {
     if (attachment?.playerId) {
       delete this.players[attachment.playerId];
       
-      // Сохраняем состояние после удаления игрока
       this.storage.put('state', {
         players: this.players,
         objects: this.objects
@@ -166,6 +189,8 @@ export class GameRoom {
     if (Object.keys(this.players).length === 0) {
       clearInterval(this.tickInterval);
       this.tickInterval = null;
+      this.tickCount = 0;
+      this.currentTPS = 0;
     }
   }
 }
