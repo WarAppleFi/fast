@@ -58,7 +58,8 @@ export class GameRoom {
         z: (Math.random() - 0.5) * 20,
         y: 0.5,
         rotation: 0,
-        health: 100
+        health: 100,
+        ping: 0 // Добавляем поле для пинга
       };
       
       await this.storage.put('state', {
@@ -66,7 +67,7 @@ export class GameRoom {
         objects: this.objects
       });
       
-      server.serializeAttachment({ playerId });
+      server.serializeAttachment({ playerId, lastPingTime: Date.now() });
       
       server.send(JSON.stringify({
         type: 'init',
@@ -106,6 +107,22 @@ export class GameRoom {
     if (!playerId || !this.players[playerId]) return;
     
     const player = this.players[playerId];
+    
+    // Обработка пинга
+    if (data.type === 'ping') {
+      const now = Date.now();
+      const ping = now - (attachment.lastPingTime || now);
+      player.ping = ping;
+      
+      // Отправляем ответ с пингом
+      ws.send(JSON.stringify({
+        type: 'pong',
+        ping: ping,
+        timestamp: now
+      }));
+      
+      return;
+    }
     
     switch(data.type) {
       case 'move':
