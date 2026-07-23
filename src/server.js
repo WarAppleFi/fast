@@ -21,7 +21,7 @@ export class GameRoom {
     const saved = await this.storage.get('state');
     if (saved) {
       this.players = saved.players || {};
-      this.objects = saved.objects || [];
+      this.objects = saved.objects || {};
     } else {
       for (let i = 0; i < 20; i++) {
         this.objects.push({
@@ -59,7 +59,7 @@ export class GameRoom {
         y: 0.5,
         rotation: 0,
         health: 100,
-        ping: 0 // Добавляем поле для пинга
+        ping: 0
       };
       
       await this.storage.put('state', {
@@ -74,7 +74,7 @@ export class GameRoom {
         playerId,
         players: this.players,
         objects: this.objects,
-        tps: 20 // Начальный TPS
+        tps: 20
       }));
       
       if (!this.tickInterval) {
@@ -114,7 +114,6 @@ export class GameRoom {
       const ping = now - (attachment.lastPingTime || now);
       player.ping = ping;
       
-      // Отправляем ответ с пингом
       ws.send(JSON.stringify({
         type: 'pong',
         ping: ping,
@@ -157,6 +156,26 @@ export class GameRoom {
           return obj;
         });
         break;
+        
+      // ===== НОВОЕ: ОБРАБОТКА ЧАТА =====
+      case 'chat':
+        const name = playerId.slice(0, 6); // Первые 6 символов ID
+        const chatMessage = {
+          type: 'chat',
+          id: playerId,
+          name: name,
+          text: data.text,
+          timestamp: Date.now()
+        };
+        
+        // Рассылаем всем подключенным клиентам
+        const msgStr = JSON.stringify(chatMessage);
+        this.ctx.getWebSockets().forEach(wsClient => {
+          try {
+            wsClient.send(msgStr);
+          } catch(e) {}
+        });
+        break;
     }
     
     await this.storage.put('state', {
@@ -166,7 +185,6 @@ export class GameRoom {
   }
 
   gameTick() {
-    // Обновляем счетчик TPS
     this.tickCount++;
     const now = Date.now();
     const elapsed = (now - this.lastTickTime) / 1000;
