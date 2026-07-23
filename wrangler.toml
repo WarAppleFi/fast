@@ -10,3 +10,7 @@ bindings = [
 [[migrations]]
 tag = "v1"
 new_classes = ["GameRoom"]
+
+# Добавьте это для явного указания
+[env.production]
+vars = { ENVIRONMENT = "production" }
