@@ -1,16 +1,10 @@
 name = "do-shooter"
 main = "src/server.js"
-compatibility_date = "2024-01-01"
+compatibility_date = "2024-07-29"
 
 [[durable_objects]]
-bindings = [
-  { name = "GAME_ROOM", class_name = "GameRoom" }
-]
+bindings = [{ name = "GAME_ROOM", class_name = "GameRoom" }]
 
 [[migrations]]
 tag = "v1"
 new_classes = ["GameRoom"]
-
-# Добавьте это для явного указания
-[env.production]
-vars = { ENVIRONMENT = "production" }
