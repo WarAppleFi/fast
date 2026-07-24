@@ -1,5 +1,5 @@
 name = "fast-warapple"
-main = "server/src/server.js"
+main = "src/server.js"
 compatibility_date = "2026-07-24"
 
 [durable_objects]
