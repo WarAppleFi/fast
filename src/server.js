@@ -1,163 +1,271 @@
-export class GameRoom {
-  constructor(state, env) {
-    this.state = state;
-    this.env = env;
-    this.clients = new Map();
+// src/server.js
+import { DurableObject } from 'cloudflare:workers';
+
+// ============ DURABLE OBJECT ============
+export class GameRoom extends DurableObject {
+  constructor(ctx, env) {
+    super(ctx, env);
     this.players = new Map();
-    this.tickCounter = 0;
-    this.tickInterval = 1000 / 60;
-    this.heartbeat = null;
+    this.sessions = new Map(); // WebSocket -> playerId
     this.worldWidth = 800;
     this.worldHeight = 600;
-    this.speed = 5;
-    this.lastState = null;
+    this.tickInterval = null;
+    this.lastBroadcast = 0;
+    this.updateCounter = 0;
+    
+    // Автоматический тик для стабильности
+    this.ctx.blockConcurrencyWhile(async () => {
+      await this.loadState();
+      this.startTicking();
+    });
   }
 
-  async fetch(request) {
-    if (request.headers.get('upgrade') !== 'websocket') {
-      return new Response('Expected websocket', { status: 400 });
-    }
-
-    const pair = new WebSocketPair();
-    const [client, server] = Object.values(pair);
-    const id = crypto.randomUUID().slice(0, 8);
-
-    server.accept();
-
-    const player = {
-      id,
-      x: Math.random() * 700 + 50,
-      y: Math.random() * 500 + 50,
-      health: 100,
-      angle: 0,
-      size: 30
-    };
-
-    this.clients.set(id, { ws: server });
-    this.players.set(id, player);
-
-    console.log(`🟢 Player joined: ${id}, total: ${this.players.size}`);
-
-    server.addEventListener('message', (ev) => {
-      try {
-        const msg = JSON.parse(ev.data);
-        const p = this.players.get(id);
-        if (!p) return;
-
-        if (msg.type === 'move') {
-          p.x = Math.max(20, Math.min(this.worldWidth - 20, msg.x));
-          p.y = Math.max(20, Math.min(this.worldHeight - 20, msg.y));
-          p.angle = msg.angle || 0;
-        } else if (msg.type === 'ping') {
-          // Ответ на пинг
-          server.send(JSON.stringify({ type: 'pong' }));
-        }
-      } catch (e) {
-        console.error('Message error:', e);
+  async loadState() {
+    try {
+      const stored = await this.ctx.storage.get('state');
+      if (stored) {
+        this.players = new Map(Object.entries(stored.players || {}));
+        this.worldWidth = stored.worldWidth || 800;
+        this.worldHeight = stored.worldHeight || 600;
+        console.log(`[GameRoom] Loaded ${this.players.size} players from storage`);
       }
-    });
-
-    server.addEventListener('close', () => {
-      this.clients.delete(id);
-      this.players.delete(id);
-      console.log(`🔴 Player left: ${id}, total: ${this.players.size}`);
-      
-      if (this.clients.size === 0 && this.heartbeat) {
-        clearInterval(this.heartbeat);
-        this.heartbeat = null;
-        console.log('⏹️ Game loop stopped');
-      }
-    });
-
-    server.addEventListener('error', (err) => {
-      console.error('WebSocket error:', err);
-    });
-
-    // Отправляем начальное состояние
-    const initPlayers = Array.from(this.players.values()).map(p => ({
-      id: p.id,
-      x: Math.round(p.x),
-      y: Math.round(p.y),
-      health: p.health,
-      angle: p.angle,
-      size: p.size
-    }));
-
-    server.send(JSON.stringify({
-      type: 'init',
-      id,
-      players: initPlayers,
-      worldWidth: this.worldWidth,
-      worldHeight: this.worldHeight
-    }));
-
-    if (!this.heartbeat) {
-      this.heartbeat = setInterval(() => {
-        this.gameLoop();
-      }, this.tickInterval);
-      console.log('▶️ Game loop started');
+    } catch (e) {
+      console.error('[GameRoom] Load state error:', e);
     }
-
-    return new Response(null, { status: 101, webSocket: client });
   }
 
-  gameLoop() {
-    this.tickCounter++;
+  async saveState() {
+    try {
+      const data = {
+        players: Object.fromEntries(this.players),
+        worldWidth: this.worldWidth,
+        worldHeight: this.worldHeight
+      };
+      await this.ctx.storage.put('state', data);
+    } catch (e) {
+      console.error('[GameRoom] Save state error:', e);
+    }
+  }
+
+  startTicking() {
+    if (this.tickInterval) return;
+    this.tickInterval = setInterval(() => {
+      this.tick();
+    }, 50); // 20 FPS для плавности
+  }
+
+  tick() {
+    // Отправляем состояние всем игрокам 20 раз в секунду
+    this.broadcastState();
     
-    // Простая логика игры - обновляем здоровье (для примера)
-    // Можно добавить здесь какую-то логику
+    // Сохраняем состояние каждые 2 секунды
+    this.updateCounter++;
+    if (this.updateCounter % 40 === 0) {
+      this.saveState();
+    }
+  }
+
+  broadcastState() {
+    if (this.sessions.size === 0) return;
     
-    // Формируем состояние
     const state = {
       type: 'state',
       players: {}
     };
-
+    
     for (const [id, player] of this.players) {
       state.players[id] = {
-        x: Math.round(player.x),
-        y: Math.round(player.y),
+        x: player.x,
+        y: player.y,
         health: player.health,
-        angle: player.angle,
-        size: player.size
+        angle: player.angle || 0,
+        size: player.size || 30,
+        id: id
       };
     }
-
-    // Сохраняем последнее состояние для сравнения
-    const message = JSON.stringify(state);
     
-    // Отправляем всем клиентам
-    let sentCount = 0;
-    for (const [pid, client] of this.clients) {
-      if (client.ws.readyState === 1) {
-        try {
-          client.ws.send(message);
-          sentCount++;
-        } catch (e) {
-          console.error('Send error:', e);
+    const msg = JSON.stringify(state);
+    
+    // Отправляем всем
+    for (const [ws, playerId] of this.sessions) {
+      try {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(msg);
         }
+      } catch (e) {
+        console.error('[GameRoom] Broadcast error:', e);
+      }
+    }
+  }
+
+  async handleWebSocket(ws) {
+    const playerId = crypto.randomUUID().slice(0, 8);
+    console.log(`[GameRoom] New player: ${playerId}`);
+    
+    // Создаем игрока
+    const player = {
+      id: playerId,
+      x: 50 + Math.random() * (this.worldWidth - 100),
+      y: 50 + Math.random() * (this.worldHeight - 100),
+      health: 100,
+      angle: 0,
+      size: 30,
+      speed: 5
+    };
+    
+    this.players.set(playerId, player);
+    this.sessions.set(ws, playerId);
+    
+    // Отправляем инициализацию
+    const initMsg = {
+      type: 'init',
+      id: playerId,
+      worldWidth: this.worldWidth,
+      worldHeight: this.worldHeight,
+      players: Array.from(this.players.values()).map(p => ({
+        id: p.id,
+        x: p.x,
+        y: p.y,
+        health: p.health,
+        angle: p.angle || 0,
+        size: p.size || 30
+      }))
+    };
+    
+    try {
+      ws.send(JSON.stringify(initMsg));
+    } catch (e) {
+      console.error('[GameRoom] Init send error:', e);
+    }
+    
+    // Сразу отправляем состояние всем
+    this.broadcastState();
+    
+    // Обработка сообщений
+    ws.addEventListener('message', async (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        await this.handleMessage(ws, playerId, data);
+      } catch (e) {
+        console.error('[GameRoom] Message error:', e);
+      }
+    });
+    
+    ws.addEventListener('close', () => {
+      this.handleDisconnect(ws, playerId);
+    });
+    
+    ws.addEventListener('error', (e) => {
+      console.error('[GameRoom] WebSocket error:', e);
+      this.handleDisconnect(ws, playerId);
+    });
+  }
+
+  async handleMessage(ws, playerId, data) {
+    const player = this.players.get(playerId);
+    if (!player) return;
+    
+    // Обработка движения
+    if (data.type === 'move') {
+      // Ограничиваем движение
+      const newX = Math.max(20, Math.min(this.worldWidth - 20, data.x));
+      const newY = Math.max(20, Math.min(this.worldHeight - 20, data.y));
+      
+      // Плавное обновление
+      player.x = newX;
+      player.y = newY;
+      player.angle = data.angle || player.angle || 0;
+      
+      // Немедленно отправляем обновление этому игроку (для отзывчивости)
+      const response = {
+        type: 'state',
+        players: {
+          [playerId]: {
+            x: player.x,
+            y: player.y,
+            health: player.health,
+            angle: player.angle,
+            size: player.size
+          }
+        }
+      };
+      
+      try {
+        ws.send(JSON.stringify(response));
+      } catch (e) {
+        // Игнорируем ошибки отправки
       }
     }
     
-    // Логируем каждые 100 тиков
-    if (this.tickCounter % 100 === 0) {
-      console.log(`📊 Tick ${this.tickCounter}: ${this.players.size} players, ${sentCount} clients`);
+    // Обработка пинга
+    if (data.type === 'ping') {
+      try {
+        ws.send(JSON.stringify({ type: 'pong' }));
+      } catch (e) {
+        // Игнорируем
+      }
     }
+  }
+
+  handleDisconnect(ws, playerId) {
+    console.log(`[GameRoom] Player disconnected: ${playerId}`);
+    
+    this.sessions.delete(ws);
+    this.players.delete(playerId);
+    
+    // Сохраняем состояние
+    this.saveState();
+    
+    // Оповещаем остальных
+    this.broadcastState();
   }
 }
 
+// ============ WORKER ============
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    const roomId = url.searchParams.get('room') || 'global';
     
-    try {
-      const id = env.GAME.idFromName(roomId);
-      const obj = env.GAME.get(id);
-      return obj.fetch(request);
-    } catch (e) {
-      console.error('Fetch error:', e);
-      return new Response('Error', { status: 500 });
+    // WebSocket upgrade
+    if (url.pathname === '/') {
+      const upgradeHeader = request.headers.get('Upgrade');
+      if (!upgradeHeader || upgradeHeader !== 'websocket') {
+        return new Response('WebSocket required', { status: 400 });
+      }
+      
+      try {
+        // Получаем или создаем игровую комнату
+        const id = env.GAME.idFromName('main');
+        const gameRoom = env.GAME.get(id);
+        
+        // Создаем WebSocket пару
+        const pair = new WebSocketPair();
+        const [client, server] = Object.values(pair);
+        
+        // Передаем серверный WebSocket в Durable Object
+        await gameRoom.handleWebSocket(server);
+        
+        // Возвращаем клиентский WebSocket
+        return new Response(null, {
+          status: 101,
+          webSocket: client,
+        });
+      } catch (e) {
+        console.error('[Worker] WebSocket error:', e);
+        return new Response('WebSocket error', { status: 500 });
+      }
     }
+    
+    // Статус
+    if (url.pathname === '/status') {
+      return new Response(JSON.stringify({
+        status: 'ok',
+        timestamp: Date.now()
+      }), {
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+    
+    return new Response('Not found', { status: 404 });
   }
 };
