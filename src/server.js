@@ -60,11 +60,7 @@ export class GameRoom {
         rotation: 0,
         health: 100,
         ping: 0,
-        lastMoveTime: Date.now(),
-        speedX: 0,
-        speedZ: 0,
-        // Добавляем очередь команд для лучшей синхронизации
-        inputQueue: []
+        lastMoveTime: Date.now()
       };
       
       await this.storage.put('state', {
@@ -135,40 +131,17 @@ export class GameRoom {
         const deltaTime = Math.min((now - (player.lastMoveTime || now)) / 1000, 0.05);
         player.lastMoveTime = now;
         
-        player.rotation = data.rotation || 0;
-        
-        if (data.keys) {
-          const speed = 5.5 * deltaTime;
-          let dx = 0, dz = 0;
+        // Просто сохраняем позицию от клиента
+        if (data.x !== undefined && data.z !== undefined) {
+          // Ограничиваем границы
+          const newX = Math.max(-30, Math.min(30, data.x));
+          const newZ = Math.max(-30, Math.min(30, data.z));
           
-          if (data.keys.w) { dx += Math.sin(player.rotation) * speed; dz += Math.cos(player.rotation) * speed; }
-          if (data.keys.s) { dx -= Math.sin(player.rotation) * speed; dz -= Math.cos(player.rotation) * speed; }
-          if (data.keys.a) { dx += Math.sin(player.rotation - Math.PI/2) * speed * 0.8; dz += Math.cos(player.rotation - Math.PI/2) * speed * 0.8; }
-          if (data.keys.d) { dx += Math.sin(player.rotation + Math.PI/2) * speed * 0.8; dz += Math.cos(player.rotation + Math.PI/2) * speed * 0.8; }
-          
-          // Полностью доверяем клиенту для плавности
-          if (data.predictedX !== undefined && data.predictedZ !== undefined) {
-            const dist = Math.hypot(data.predictedX - player.x, data.predictedZ - player.z);
-            if (dist < 1.0) {
-              // Мягкая коррекция
-              player.x += (data.predictedX - player.x) * 0.15;
-              player.z += (data.predictedZ - player.z) * 0.15;
-            } else {
-              // При большом расхождении используем серверный расчет
-              player.x += dx;
-              player.z += dz;
-            }
-          } else {
-            player.x += dx;
-            player.z += dz;
-          }
-          
-          player.speedX = dx / deltaTime;
-          player.speedZ = dz / deltaTime;
+          // Плавно обновляем позицию на сервере
+          player.x += (newX - player.x) * 0.5;
+          player.z += (newZ - player.z) * 0.5;
+          player.rotation = data.rotation || 0;
         }
-        
-        player.x = Math.max(-30, Math.min(30, player.x));
-        player.z = Math.max(-30, Math.min(30, player.z));
         break;
         
       case 'shoot':
