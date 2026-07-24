@@ -8,14 +8,13 @@ export class GameRoom extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
     this.players = new Map();
-    this.sessions = new Map();
     this.worldWidth = 800;
     this.worldHeight = 600;
-    this.broadcastInterval = null;
+    this.lastUpdate = Date.now();
+    this.updateCounter = 0;
   }
 
   async initialize() {
-    // Загружаем сохраненное состояние
     try {
       const stored = await this.ctx.storage.get('state');
       if (stored) {
@@ -26,13 +25,6 @@ export class GameRoom extends DurableObject {
       }
     } catch (e) {
       console.error('[GameRoom] Load error:', e);
-    }
-
-    // Запускаем постоянную рассылку состояний
-    if (!this.broadcastInterval) {
-      this.broadcastInterval = setInterval(() => {
-        this.broadcastState();
-      }, 50); // 20 раз в секунду
     }
   }
 
@@ -49,11 +41,14 @@ export class GameRoom extends DurableObject {
     }
   }
 
-  broadcastState() {
-    if (this.sessions.size === 0) return;
-
+  // ============ HTTP METHODS ============
+  
+  async getState() {
+    await this.initialize();
+    
     const state = {
       type: 'state',
+      timestamp: Date.now(),
       players: {}
     };
 
@@ -67,160 +62,99 @@ export class GameRoom extends DurableObject {
       };
     }
 
-    const msg = JSON.stringify(state);
-    const deadSessions = [];
-
-    for (const [ws, playerId] of this.sessions) {
-      try {
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(msg);
-        } else {
-          deadSessions.push(ws);
-        }
-      } catch (e) {
-        deadSessions.push(ws);
-      }
-    }
-
-    // Удаляем мертвые сессии
-    for (const ws of deadSessions) {
-      const playerId = this.sessions.get(ws);
-      if (playerId) {
-        this.players.delete(playerId);
-        this.sessions.delete(ws);
-        console.log(`[GameRoom] Removed dead session: ${playerId}`);
-      }
-    }
+    return state;
   }
 
-  async handleWebSocket(ws) {
+  async addPlayer(playerId) {
     await this.initialize();
+    
+    if (this.players.has(playerId)) {
+      return this.players.get(playerId);
+    }
 
-    const playerId = crypto.randomUUID().slice(0, 8);
-    console.log(`[GameRoom] New connection: ${playerId}`);
-
-    // Создаем игрока
     const player = {
       id: playerId,
       x: 100 + Math.random() * (this.worldWidth - 200),
       y: 100 + Math.random() * (this.worldHeight - 200),
       health: 100,
       angle: 0,
-      size: 30
+      size: 30,
+      lastActive: Date.now()
     };
 
     this.players.set(playerId, player);
-    this.sessions.set(ws, playerId);
-
-    // Отправляем инициализацию
-    const initMsg = {
-      type: 'init',
-      id: playerId,
-      worldWidth: this.worldWidth,
-      worldHeight: this.worldHeight,
-      players: Array.from(this.players.values()).map(p => ({
-        id: p.id,
-        x: p.x,
-        y: p.y,
-        health: p.health,
-        angle: p.angle || 0,
-        size: p.size || 30
-      }))
-    };
-
-    try {
-      ws.send(JSON.stringify(initMsg));
-      console.log(`[GameRoom] Init sent to ${playerId}`);
-    } catch (e) {
-      console.error('[GameRoom] Init send error:', e);
-      this.sessions.delete(ws);
-      this.players.delete(playerId);
-      return;
-    }
-
-    // Сразу отправляем состояние всем
-    this.broadcastState();
-
-    // Обработка сообщений
-    ws.addEventListener('message', (event) => {
-      try {
-        const data = JSON.parse(event.data);
-        this.handleMessage(ws, playerId, data);
-      } catch (e) {
-        console.error('[GameRoom] Message error:', e);
-      }
-    });
-
-    ws.addEventListener('close', () => {
-      console.log(`[GameRoom] Connection closed: ${playerId}`);
-      this.handleDisconnect(ws, playerId);
-    });
-
-    ws.addEventListener('error', (error) => {
-      console.error(`[GameRoom] Connection error: ${playerId}`, error);
-      this.handleDisconnect(ws, playerId);
-    });
+    await this.saveState();
+    console.log(`[GameRoom] Player joined: ${playerId} (${this.players.size} total)`);
+    
+    return player;
   }
 
-  handleMessage(ws, playerId, data) {
+  async updatePlayer(playerId, data) {
+    await this.initialize();
+    
     const player = this.players.get(playerId);
-    if (!player) return;
+    if (!player) return null;
 
-    if (data.type === 'move') {
-      // Ограничиваем движение
-      const newX = Math.max(20, Math.min(this.worldWidth - 20, data.x));
-      const newY = Math.max(20, Math.min(this.worldHeight - 20, data.y));
+    // Обновляем позицию
+    if (data.x !== undefined) {
+      player.x = Math.max(20, Math.min(this.worldWidth - 20, data.x));
+    }
+    if (data.y !== undefined) {
+      player.y = Math.max(20, Math.min(this.worldHeight - 20, data.y));
+    }
+    if (data.angle !== undefined) {
+      player.angle = data.angle;
+    }
+    if (data.health !== undefined) {
+      player.health = Math.max(0, Math.min(100, data.health));
+    }
+    
+    player.lastActive = Date.now();
+    this.updateCounter++;
 
-      // Обновляем позицию
-      player.x = newX;
-      player.y = newY;
-      player.angle = data.angle || player.angle || 0;
-
-      // Немедленно подтверждаем этому игроку (для отзывчивости)
-      const response = {
-        type: 'state',
-        players: {
-          [playerId]: {
-            x: player.x,
-            y: player.y,
-            health: player.health,
-            angle: player.angle,
-            size: player.size
-          }
-        }
-      };
-
-      try {
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify(response));
-        }
-      } catch (e) {
-        // Игнорируем ошибки отправки
-      }
+    // Сохраняем каждые 10 обновлений
+    if (this.updateCounter % 10 === 0) {
+      await this.saveState();
     }
 
-    if (data.type === 'ping') {
-      try {
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ type: 'pong' }));
-        }
-      } catch (e) {
-        // Игнорируем
-      }
-    }
+    return player;
   }
 
-  handleDisconnect(ws, playerId) {
-    if (this.sessions.has(ws)) {
-      this.sessions.delete(ws);
-    }
-
+  async removePlayer(playerId) {
+    await this.initialize();
+    
     if (this.players.has(playerId)) {
       this.players.delete(playerId);
-      this.saveState();
-      this.broadcastState();
-      console.log(`[GameRoom] Player removed: ${playerId}`);
+      await this.saveState();
+      console.log(`[GameRoom] Player left: ${playerId} (${this.players.size} total)`);
+      return true;
     }
+    return false;
+  }
+
+  async cleanupInactive() {
+    await this.initialize();
+    
+    const now = Date.now();
+    const timeout = 30000; // 30 секунд неактивности
+    let removed = 0;
+
+    for (const [id, player] of this.players) {
+      if (now - player.lastActive > timeout) {
+        this.players.delete(id);
+        removed++;
+      }
+    }
+
+    if (removed > 0) {
+      await this.saveState();
+      console.log(`[GameRoom] Cleaned up ${removed} inactive players`);
+    }
+  }
+
+  async getPlayerCount() {
+    await this.initialize();
+    return this.players.size;
   }
 }
 
@@ -230,42 +164,156 @@ export class GameRoom extends DurableObject {
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+    const path = url.pathname;
+    const gameId = url.searchParams.get('id') || 'main';
+    
+    // Получаем Durable Object
+    const id = env.GAME.idFromName(gameId);
+    const gameRoom = env.GAME.get(id);
 
-    // WebSocket endpoint
-    if (url.pathname === '/') {
-      const upgradeHeader = request.headers.get('Upgrade');
-      if (!upgradeHeader || upgradeHeader !== 'websocket') {
-        return new Response('WebSocket required', { status: 400 });
-      }
-
+    // ============ GET STATE ============
+    if (path === '/state') {
       try {
-        // Создаем WebSocket пару
-        const pair = new WebSocketPair();
-        const [client, server] = Object.values(pair);
-
-        // Получаем Durable Object
-        const id = env.GAME.idFromName('main');
-        const gameRoom = env.GAME.get(id);
-
-        // Обрабатываем серверный WebSocket
-        await gameRoom.handleWebSocket(server);
-
-        // Возвращаем клиентский WebSocket
-        return new Response(null, {
-          status: 101,
-          webSocket: client,
+        const state = await gameRoom.getState();
+        return new Response(JSON.stringify(state), {
+          headers: { 
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*'
+          }
         });
       } catch (e) {
-        console.error('[Worker] Error:', e);
-        return new Response('WebSocket error', { status: 500 });
+        console.error('[Worker] State error:', e);
+        return new Response(JSON.stringify({ error: 'Failed to get state' }), {
+          status: 500,
+          headers: { 'Content-Type': 'application/json' }
+        });
       }
     }
 
-    // Health check
-    if (url.pathname === '/health') {
-      return new Response('OK', { status: 200 });
+    // ============ JOIN ============
+    if (path === '/join') {
+      try {
+        const playerId = url.searchParams.get('playerId') || crypto.randomUUID().slice(0, 8);
+        const player = await gameRoom.addPlayer(playerId);
+        
+        const state = await gameRoom.getState();
+        
+        return new Response(JSON.stringify({
+          success: true,
+          playerId: playerId,
+          player: player,
+          state: state
+        }), {
+          headers: { 
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*'
+          }
+        });
+      } catch (e) {
+        console.error('[Worker] Join error:', e);
+        return new Response(JSON.stringify({ error: 'Failed to join' }), {
+          status: 500,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
     }
 
+    // ============ MOVE ============
+    if (path === '/move') {
+      try {
+        const playerId = url.searchParams.get('playerId');
+        if (!playerId) {
+          return new Response(JSON.stringify({ error: 'Missing playerId' }), {
+            status: 400,
+            headers: { 'Content-Type': 'application/json' }
+          });
+        }
+
+        const data = await request.json();
+        const player = await gameRoom.updatePlayer(playerId, data);
+        
+        if (!player) {
+          return new Response(JSON.stringify({ error: 'Player not found' }), {
+            status: 404,
+            headers: { 'Content-Type': 'application/json' }
+          });
+        }
+
+        return new Response(JSON.stringify({
+          success: true,
+          player: player
+        }), {
+          headers: { 
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*'
+          }
+        });
+      } catch (e) {
+        console.error('[Worker] Move error:', e);
+        return new Response(JSON.stringify({ error: 'Failed to move' }), {
+          status: 500,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+    }
+
+    // ============ LEAVE ============
+    if (path === '/leave') {
+      try {
+        const playerId = url.searchParams.get('playerId');
+        if (playerId) {
+          await gameRoom.removePlayer(playerId);
+        }
+        return new Response(JSON.stringify({ success: true }), {
+          headers: { 
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*'
+          }
+        });
+      } catch (e) {
+        console.error('[Worker] Leave error:', e);
+        return new Response(JSON.stringify({ error: 'Failed to leave' }), {
+          status: 500,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+    }
+
+    // ============ CLEANUP ============
+    if (path === '/cleanup') {
+      try {
+        await gameRoom.cleanupInactive();
+        return new Response(JSON.stringify({ success: true }), {
+          headers: { 
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*'
+          }
+        });
+      } catch (e) {
+        console.error('[Worker] Cleanup error:', e);
+        return new Response(JSON.stringify({ error: 'Failed to cleanup' }), {
+          status: 500,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+    }
+
+    // ============ HEALTH ============
+    if (path === '/health' || path === '/') {
+      const count = await gameRoom.getPlayerCount();
+      return new Response(JSON.stringify({
+        status: 'OK',
+        players: count,
+        timestamp: Date.now()
+      }), {
+        headers: { 
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*'
+        }
+      });
+    }
+
+    // ============ 404 ============
     return new Response('Not found', { status: 404 });
   }
 };
