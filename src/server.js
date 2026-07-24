@@ -1,32 +1,30 @@
-// server.js - Cloudflare Worker с Durable Object
+// server.js - Полный сервер для Cloudflare Workers с Durable Object
 
 // ===== DURABLE OBJECT =====
 export class GameRoom {
   constructor(state, env) {
     this.state = state;
     this.env = env;
-    this.players = new Map(); // id -> {x, z, rotation, pitch, health, name}
+    this.players = new Map();
     this.objects = [];
-    this.sessions = new Map(); // WebSocket -> playerId
+    this.sessions = new Map();
     this.tickInterval = null;
     this.lastTick = Date.now();
     this.tickCount = 0;
     this.tps = 0;
     this.lastTpsUpdate = Date.now();
+    this.playerNames = new Map();
   }
 
   async initialize() {
-    // Восстанавливаем состояние из storage
     const stored = await this.state.storage.get('state');
     if (stored) {
       this.players = new Map(Object.entries(stored.players || {}));
       this.objects = stored.objects || [];
     }
     
-    // Запускаем игровой тик (20 раз в секунду)
     this.tickInterval = setInterval(() => this.gameTick(), 50);
     
-    // Обновляем TPS каждую секунду
     setInterval(() => {
       const now = Date.now();
       const delta = (now - this.lastTpsUpdate) / 1000;
@@ -38,26 +36,23 @@ export class GameRoom {
     }, 1000);
   }
 
-  // ===== ИГРОВОЙ ТИК =====
   gameTick() {
     this.tickCount++;
     
-    // Обновляем здоровье (регенерация)
     for (const [id, player] of this.players) {
       if (player.health < 100) {
         player.health = Math.min(100, player.health + 0.5);
       }
     }
     
-    // Отправляем дельту всем игрокам
     this.broadcastDelta();
   }
 
-  // ===== ОБРАБОТКА ВЕБСОКЕТА =====
   async handleWebSocket(ws) {
     const playerId = crypto.randomUUID();
+    const name = `Player${Math.floor(Math.random() * 1000)}`;
+    this.playerNames.set(playerId, name);
     
-    // Создаем игрока
     const spawnPos = this.getRandomSpawn();
     const player = {
       x: spawnPos.x,
@@ -66,16 +61,14 @@ export class GameRoom {
       rotation: 0,
       pitch: 0,
       health: 100,
-      name: `Player${Math.floor(Math.random() * 1000)}`
+      name: name
     };
     
     this.players.set(playerId, player);
     this.sessions.set(ws, playerId);
     
-    // Сохраняем состояние
     await this.saveState();
     
-    // Отправляем инициализацию
     ws.send(JSON.stringify({
       type: 'init',
       playerId: playerId,
@@ -84,7 +77,6 @@ export class GameRoom {
       tps: this.tps
     }));
     
-    // Обработка сообщений
     ws.addEventListener('message', async (event) => {
       try {
         const data = JSON.parse(event.data);
@@ -97,12 +89,12 @@ export class GameRoom {
     ws.addEventListener('close', () => {
       this.players.delete(playerId);
       this.sessions.delete(ws);
+      this.playerNames.delete(playerId);
       this.saveState();
       this.broadcastDelta();
     });
   }
 
-  // ===== ОБРАБОТКА СООБЩЕНИЙ =====
   async handleMessage(ws, data) {
     const playerId = this.sessions.get(ws);
     if (!playerId) return;
@@ -112,12 +104,10 @@ export class GameRoom {
     
     switch(data.type) {
       case 'move':
-        // Проверяем валидность движения (античит)
         const dx = data.x - player.x;
         const dz = data.z - player.z;
         const dist = Math.hypot(dx, dz);
         
-        // Максимальная скорость ~6 единиц в секунду, тик 50мс => макс 0.3 за тик
         if (dist < 0.5) {
           player.x = data.x;
           player.z = data.z;
@@ -131,7 +121,7 @@ export class GameRoom {
         break;
         
       case 'chat':
-        const name = player.name || 'Unknown';
+        const name = this.playerNames.get(playerId) || 'Unknown';
         this.broadcastChat(name, data.text, playerId);
         break;
         
@@ -141,12 +131,9 @@ export class GameRoom {
     }
   }
 
-  // ===== СТРЕЛЬБА =====
   handleShoot(playerId, player) {
-    // Проверяем, жив ли игрок
     if (player.health <= 0) return;
     
-    // Рейкаст по всем игрокам
     const origin = { x: player.x, z: player.z };
     const angle = player.rotation;
     const direction = { x: -Math.sin(angle), z: -Math.cos(angle) };
@@ -158,20 +145,17 @@ export class GameRoom {
       if (id === playerId) continue;
       if (target.health <= 0) continue;
       
-      // Проверка попадания в прямоугольник 0.7x0.5
       const dx = target.x - origin.x;
       const dz = target.z - origin.z;
       
-      // Проекция на направление
       const proj = dx * direction.x + dz * direction.z;
-      if (proj < 0 || proj > 15) continue; // Макс дистанция 15
+      if (proj < 0 || proj > 15) continue;
       
-      // Перпендикулярное расстояние
       const perpX = dx - proj * direction.x;
       const perpZ = dz - proj * direction.z;
       const perpDist = Math.hypot(perpX, perpZ);
       
-      if (perpDist < 0.8) { // Ширина игрока ~0.7
+      if (perpDist < 0.8) {
         if (proj < closestDist) {
           closestDist = proj;
           closestHit = id;
@@ -179,13 +163,11 @@ export class GameRoom {
       }
     }
     
-    // Наносим урон
     if (closestHit) {
       const target = this.players.get(closestHit);
       if (target) {
         target.health = Math.max(0, target.health - 25);
         
-        // Если игрок умер, телепортируем
         if (target.health <= 0) {
           const spawn = this.getRandomSpawn();
           target.x = spawn.x;
@@ -198,7 +180,6 @@ export class GameRoom {
     this.broadcastDelta();
   }
 
-  // ===== РАССЫЛКА =====
   broadcastDelta() {
     const data = {
       type: 'delta',
@@ -213,9 +194,7 @@ export class GameRoom {
         if (ws.readyState === WebSocket.OPEN) {
           ws.send(message);
         }
-      } catch (e) {
-        // Игнорируем ошибки отправки
-      }
+      } catch (e) {}
     }
   }
 
@@ -236,7 +215,6 @@ export class GameRoom {
     }
   }
 
-  // ===== ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ =====
   getPlayersData() {
     const result = {};
     for (const [id, player] of this.players) {
@@ -276,7 +254,6 @@ export class GameRoom {
     await this.state.storage.put('state', data);
   }
 
-  // Очистка при остановке
   async dispose() {
     if (this.tickInterval) {
       clearInterval(this.tickInterval);
@@ -290,7 +267,6 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     
-    // WebSocket endpoint
     if (url.pathname === '/ws') {
       const upgrade = await env.ROOM.getWebSocket(request);
       if (upgrade) {
@@ -302,7 +278,6 @@ export default {
       return new Response('WebSocket upgrade failed', { status: 400 });
     }
     
-    // Статус
     if (url.pathname === '/status') {
       return new Response(JSON.stringify({ status: 'ok' }), {
         headers: { 'Content-Type': 'application/json' }
