@@ -46,6 +46,7 @@ export class GameRoom {
   gameTick() {
     this.tickCount++;
     
+    // Восстановление здоровья
     for (const [id, player] of this.players) {
       if (player.health < 100) {
         player.health = Math.min(100, player.health + 0.5);
@@ -213,7 +214,9 @@ export class GameRoom {
         if (ws.readyState === WebSocket.OPEN) {
           ws.send(message);
         }
-      } catch (e) {}
+      } catch (e) {
+        // Игнорируем ошибки отправки
+      }
     }
   }
 
@@ -230,7 +233,9 @@ export class GameRoom {
         if (ws.readyState === WebSocket.OPEN) {
           ws.send(message);
         }
-      } catch (e) {}
+      } catch (e) {
+        // Игнорируем ошибки отправки
+      }
     }
   }
 
@@ -290,6 +295,19 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     
+    // Обработка CORS для всех запросов
+    const corsHeaders = {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type',
+    };
+    
+    if (request.method === 'OPTIONS') {
+      return new Response(null, {
+        headers: corsHeaders,
+      });
+    }
+    
     // WebSocket endpoint
     if (url.pathname === '/ws') {
       try {
@@ -309,11 +327,15 @@ export default {
         // Возвращаем клиентский WebSocket
         return new Response(null, {
           status: 101,
-          webSocket: client
+          webSocket: client,
+          headers: corsHeaders,
         });
       } catch (e) {
         console.error('WebSocket upgrade error:', e);
-        return new Response('WebSocket upgrade failed: ' + e.message, { status: 400 });
+        return new Response('WebSocket upgrade failed: ' + e.message, { 
+          status: 400,
+          headers: corsHeaders,
+        });
       }
     }
     
@@ -324,10 +346,16 @@ export default {
         timestamp: Date.now(),
         environment: env.ENVIRONMENT || 'development'
       }), {
-        headers: { 'Content-Type': 'application/json' }
+        headers: {
+          'Content-Type': 'application/json',
+          ...corsHeaders
+        }
       });
     }
     
-    return new Response('Not found', { status: 404 });
+    return new Response('Not found', { 
+      status: 404,
+      headers: corsHeaders
+    });
   }
 };
