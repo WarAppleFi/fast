@@ -1,5 +1,6 @@
 name = "do-shooter"
 main = "src/server.js"
+type = "javascript"
 compatibility_date = "2024-01-01"
 
 [durable_objects]
