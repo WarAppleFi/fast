@@ -85,3 +85,4 @@ export default {
     return obj.fetch(request);
   }
 };
+
