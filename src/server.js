@@ -1,679 +1,287 @@
-// server.js - Полностью оптимизированный для вашего клиента
+// server.js - Cloudflare Worker с Durable Object
 
+// ===== DURABLE OBJECT =====
 export class GameRoom {
-  constructor(ctx, env) {
-    this.ctx = ctx;
+  constructor(state, env) {
+    this.state = state;
     this.env = env;
-    this.storage = ctx.storage;
-    this.id = ctx.id.toString();
-    
-    // НАСТРОЙКИ ПОД КЛИЕНТ
-    this.config = {
-      tickRate: 30,              // 30 TPS
-      stateSendRate: 5,          // 5 полных состояний в секунду
-      snapshotInterval: 200,     // Снапшоты каждые 200ms
-      maxPlayers: 50,
-      maxObjects: 100,
-      moveThreshold: 0.01,       // Минимальное изменение
-      maxSpeed: 12,              // Максимальная скорость
-      cleanupInterval: 5000,
-      heartbeatRate: 5
-    };
-    
-    // Состояние
-    this.players = new Map();
+    this.players = new Map(); // id -> {x, z, rotation, pitch, health, name}
     this.objects = [];
-    this.isInitialized = false;
+    this.sessions = new Map(); // WebSocket -> playerId
     this.tickInterval = null;
-    this.lastTickTime = Date.now();
+    this.lastTick = Date.now();
     this.tickCount = 0;
-    this.currentTPS = 0;
-    this.lastSnapshot = 0;
-    this.lastCleanup = 0;
-    
-    // Буферы
-    this.moveBuffer = [];
-    this.stateBuffer = [];
-    
-    // Кэши
-    this.playerCache = new Map();
-    this.wsCache = new Map();
-    
-    this.initialize();
+    this.tps = 0;
+    this.lastTpsUpdate = Date.now();
   }
 
-  // ===== ИНИЦИАЛИЗАЦИЯ =====
   async initialize() {
-    if (this.isInitialized) return;
-    this.isInitialized = true;
+    // Восстанавливаем состояние из storage
+    const stored = await this.state.storage.get('state');
+    if (stored) {
+      this.players = new Map(Object.entries(stored.players || {}));
+      this.objects = stored.objects || [];
+    }
     
-    try {
-      const saved = await this.storage.get('state');
-      if (saved && saved.objects) {
-        this.objects = saved.objects;
-        if (saved.players) {
-          for (const [id, data] of Object.entries(saved.players)) {
-            this.players.set(id, data);
-          }
-        }
-        console.log(`[GameRoom] Loaded ${this.objects.length} objects, ${this.players.size} players`);
-      } else {
-        this.generateObjects();
-        await this.saveState();
+    // Запускаем игровой тик (20 раз в секунду)
+    this.tickInterval = setInterval(() => this.gameTick(), 50);
+    
+    // Обновляем TPS каждую секунду
+    setInterval(() => {
+      const now = Date.now();
+      const delta = (now - this.lastTpsUpdate) / 1000;
+      if (delta > 0) {
+        this.tps = Math.round(this.tickCount / delta);
+        this.tickCount = 0;
+        this.lastTpsUpdate = now;
       }
-    } catch (error) {
-      console.error('[GameRoom] Init error:', error);
-      this.generateObjects();
-      await this.saveState();
-    }
+    }, 1000);
+  }
+
+  // ===== ИГРОВОЙ ТИК =====
+  gameTick() {
+    this.tickCount++;
     
-    this.startGameLoop();
-  }
-
-  generateObjects() {
-    this.objects = [];
-    for (let i = 0; i < 20; i++) {
-      this.objects.push({
-        id: i,
-        x: (Math.random() - 0.5) * 40,
-        z: (Math.random() - 0.5) * 40,
-        y: 1,
-        w: 2,
-        h: 2 + Math.random() * 3,
-        d: 2,
-        color: Math.floor(Math.random() * 0xffffff)
-      });
-    }
-  }
-
-  async saveState() {
-    try {
-      await this.storage.put('state', {
-        players: Object.fromEntries(this.players),
-        objects: this.objects
-      });
-    } catch (error) {
-      console.error('[GameRoom] Save error:', error);
-    }
-  }
-
-  startGameLoop() {
-    if (this.tickInterval) clearInterval(this.tickInterval);
-    this.tickInterval = setInterval(() => this.gameTick(), 1000 / this.config.tickRate);
-    this.lastTickTime = Date.now();
-    this.tickCount = 0;
-    console.log('[GameRoom] Game loop started');
-  }
-
-  stopGameLoop() {
-    if (this.tickInterval) {
-      clearInterval(this.tickInterval);
-      this.tickInterval = null;
-    }
-  }
-
-  // ===== СЖАТИЕ ДАННЫХ (для клиента) =====
-  compressPlayer(player) {
-    return {
-      x: Math.round(player.x * 100) / 100,
-      z: Math.round(player.z * 100) / 100,
-      y: Math.round(player.y * 100) / 100,
-      rotation: Math.round(player.rotation * 100) / 100,
-      pitch: Math.round(player.pitch * 100) / 100,
-      health: Math.round(player.health)
-    };
-  }
-
-  compressState() {
-    const players = {};
+    // Обновляем здоровье (регенерация)
     for (const [id, player] of this.players) {
-      players[id] = this.compressPlayer(player);
+      if (player.health < 100) {
+        player.health = Math.min(100, player.health + 0.5);
+      }
     }
     
-    return {
-      players: players,
-      objects: this.objects.map(obj => ({
-        id: obj.id,
-        x: Math.round(obj.x * 100) / 100,
-        z: Math.round(obj.z * 100) / 100,
-        y: Math.round(obj.y * 100) / 100,
-        h: Math.round(obj.h * 10) / 10,
-        w: Math.round(obj.w * 10) / 10,
-        d: Math.round(obj.d * 10) / 10,
-        color: obj.color
-      })),
-      timestamp: Date.now()
-    };
+    // Отправляем дельту всем игрокам
+    this.broadcastDelta();
   }
 
-  // ===== WEB SOCKET =====
-  async handleWebSocket() {
-    if (this.players.size >= this.config.maxPlayers) {
-      return new Response('Server full', { status: 429 });
-    }
-    
-    await this.cleanupAllPlayers();
-    
-    const pair = new WebSocketPair();
-    const [client, server] = Object.values(pair);
-    this.ctx.acceptWebSocket(server);
+  // ===== ОБРАБОТКА ВЕБСОКЕТА =====
+  async handleWebSocket(ws) {
+    const playerId = crypto.randomUUID();
     
     // Создаем игрока
-    const playerId = crypto.randomUUID();
-    const startX = (Math.random() - 0.5) * 10;
-    const startZ = (Math.random() - 0.5) * 10;
-    
+    const spawnPos = this.getRandomSpawn();
     const player = {
-      id: playerId,
-      x: startX,
-      z: startZ,
-      y: 0.5,
+      x: spawnPos.x,
+      z: spawnPos.z,
+      y: 0,
       rotation: 0,
       pitch: 0,
       health: 100,
-      ping: 0,
-      lastMoveTime: Date.now(),
-      connectedAt: Date.now(),
-      lastUpdate: Date.now(),
-      lastActivity: Date.now(),
-      wsConnected: true,
-      isMoving: false,
-      speed: 0
+      name: `Player${Math.floor(Math.random() * 1000)}`
     };
     
     this.players.set(playerId, player);
-    this.playerCache.set(playerId, player);
+    this.sessions.set(ws, playerId);
     
-    const wsData = {
-      playerId,
-      lastPingTime: Date.now(),
-      lastActivity: Date.now()
-    };
-    server.serializeAttachment(wsData);
-    this.wsCache.set(server, wsData);
-    
+    // Сохраняем состояние
     await this.saveState();
     
-    // ОТПРАВКА INIT (как ждет клиент)
-    const initData = {
+    // Отправляем инициализацию
+    ws.send(JSON.stringify({
       type: 'init',
       playerId: playerId,
-      players: Object.fromEntries(this.players),
+      players: this.getPlayersData(),
       objects: this.objects,
-      config: {
-        tickRate: this.config.tickRate,
-        interpolationDelay: 80,
-        moveThreshold: this.config.moveThreshold
-      },
-      serverTime: Date.now()
-    };
-    
-    server.send(JSON.stringify(initData));
-    
-    if (!this.tickInterval) {
-      this.startGameLoop();
-    }
-    
-    return new Response(null, { status: 101, webSocket: client });
-  }
-
-  // ===== ОБРАБОТЧИКИ СООБЩЕНИЙ =====
-  async webSocketMessage(ws, message) {
-    try {
-      const data = JSON.parse(message);
-      const wsData = this.wsCache.get(ws);
-      
-      if (!wsData?.playerId) {
-        ws.close(1000);
-        return;
-      }
-      
-      const player = this.players.get(wsData.playerId);
-      if (!player) {
-        ws.close(1000);
-        return;
-      }
-      
-      const now = Date.now();
-      wsData.lastActivity = now;
-      player.lastActivity = now;
-      
-      // Поддерживаем оба формата (type и t)
-      const type = data.type || data.t;
-      
-      switch (type) {
-        case 'ping':
-          this.handlePing(ws, player, wsData, now);
-          break;
-          
-        case 'move':
-          this.handleMove(player, data, now);
-          break;
-          
-        case 'shoot':
-          this.handleShoot(player, data, now);
-          break;
-          
-        case 'chat':
-          this.handleChat(player, data, now);
-          break;
-          
-        default:
-          console.warn(`[WebSocket] Unknown type: ${type}`);
-      }
-      
-    } catch (error) {
-      console.error('[WebSocket] Error:', error);
-    }
-  }
-
-  // ===== PING =====
-  handlePing(ws, player, wsData, now) {
-    const ping = now - (wsData.lastPingTime || now);
-    player.ping = Math.min(ping, 500);
-    
-    ws.send(JSON.stringify({
-      type: 'pong',
-      ping: player.ping,
-      timestamp: now,
-      serverTime: now
+      tps: this.tps
     }));
     
-    wsData.lastPingTime = now;
-  }
-
-  // ===== MOVE (оптимизированный) =====
-  handleMove(player, data, now) {
-    const deltaTime = Math.min((now - player.lastMoveTime) / 1000, 0.05);
-    player.lastMoveTime = now;
-    
-    let hasChanges = false;
-    const changes = { id: player.id };
-    
-    // Проверяем позицию
-    if (data.x !== undefined && data.z !== undefined) {
-      const newX = Math.max(-30, Math.min(30, data.x));
-      const newZ = Math.max(-30, Math.min(30, data.z));
-      
-      const dx = newX - player.x;
-      const dz = newZ - player.z;
-      const distance = Math.sqrt(dx*dx + dz*dz);
-      
-      // Анти-чит: проверка скорости
-      const maxSpeed = this.config.maxSpeed * deltaTime + 0.5;
-      
-      if (distance < maxSpeed) {
-        player.x = newX;
-        player.z = newZ;
-        player.isMoving = distance > 0.01;
-        player.speed = distance / deltaTime;
-        
-        changes.x = player.x;
-        changes.z = player.z;
-        hasChanges = true;
-      } else if (distance > 1) {
-        // Подозрительное движение - телепорт обратно
-        console.warn(`[AntiCheat] Player ${player.id} moved too fast: ${distance}`);
-        ws.send(JSON.stringify({
-          type: 'teleport',
-          x: player.x,
-          z: player.z
-        }));
-        return;
-      }
-    }
-    
-    // Повороты
-    if (data.rotation !== undefined) {
-      player.rotation = data.rotation;
-      changes.rotation = player.rotation;
-      hasChanges = true;
-    }
-    
-    if (data.pitch !== undefined) {
-      player.pitch = Math.max(-Math.PI/2, Math.min(Math.PI/2, data.pitch));
-      changes.pitch = player.pitch;
-      hasChanges = true;
-    }
-    
-    player.lastUpdate = now;
-    player.wsConnected = true;
-    
-    // Добавляем в буфер только если есть изменения
-    if (hasChanges) {
-      this.moveBuffer.push({
-        id: player.id,
-        x: player.x,
-        z: player.z,
-        rotation: player.rotation,
-        pitch: player.pitch,
-        time: now
-      });
-      
-      // Ограничиваем буфер
-      if (this.moveBuffer.length > 100) {
-        this.moveBuffer = this.moveBuffer.slice(-50);
-      }
-    }
-  }
-
-  // ===== SHOOT =====
-  handleShoot(player, data, now) {
-    const cooldown = 100;
-    if (now - (player.lastShootTime || 0) < cooldown) return;
-    player.lastShootTime = now;
-    
-    // Проверка попадания
-    const rayX = player.x + Math.sin(player.rotation || 0) * 3;
-    const rayZ = player.z + Math.cos(player.rotation || 0) * 3;
-    
-    let hit = false;
-    const hitObjects = [];
-    
-    for (const obj of this.objects) {
-      const dx = obj.x - rayX;
-      const dz = obj.z - rayZ;
-      const distance = Math.sqrt(dx*dx + dz*dz);
-      
-      if (distance < 2 && obj.h > 0) {
-        hit = true;
-        obj.h = Math.max(0, obj.h - 0.5);
-        hitObjects.push({
-          id: obj.id,
-          h: obj.h,
-          x: obj.x,
-          z: obj.z,
-          y: obj.y
-        });
-      }
-    }
-    
-    this.objects = this.objects.filter(obj => obj.h > 0);
-    
-    // Отправляем результат
-    this.broadcast({
-      type: 'shoot_result',
-      playerId: player.id,
-      hit: hit,
-      position: { x: player.x, z: player.z },
-      objects: hitObjects,
-      timestamp: now
-    });
-    
-    if (hitObjects.length > 0) {
-      this.saveState();
-    }
-  }
-
-  // ===== CHAT =====
-  handleChat(player, data, now) {
-    const name = player.id.slice(0, 6);
-    this.broadcast({
-      type: 'chat',
-      id: player.id,
-      name: name,
-      text: (data.text || '').substring(0, 100),
-      timestamp: now
-    });
-  }
-
-  // ===== BROADCAST =====
-  broadcast(data) {
-    const message = JSON.stringify(data);
-    for (const ws of this.ctx.getWebSockets()) {
+    // Обработка сообщений
+    ws.addEventListener('message', async (event) => {
       try {
-        ws.send(message);
+        const data = JSON.parse(event.data);
+        await this.handleMessage(ws, data);
+      } catch (e) {
+        console.error('Message error:', e);
+      }
+    });
+    
+    ws.addEventListener('close', () => {
+      this.players.delete(playerId);
+      this.sessions.delete(ws);
+      this.saveState();
+      this.broadcastDelta();
+    });
+  }
+
+  // ===== ОБРАБОТКА СООБЩЕНИЙ =====
+  async handleMessage(ws, data) {
+    const playerId = this.sessions.get(ws);
+    if (!playerId) return;
+    
+    const player = this.players.get(playerId);
+    if (!player) return;
+    
+    switch(data.type) {
+      case 'move':
+        // Проверяем валидность движения (античит)
+        const dx = data.x - player.x;
+        const dz = data.z - player.z;
+        const dist = Math.hypot(dx, dz);
+        
+        // Максимальная скорость ~6 единиц в секунду, тик 50мс => макс 0.3 за тик
+        if (dist < 0.5) {
+          player.x = data.x;
+          player.z = data.z;
+          player.rotation = data.rotation || player.rotation;
+          player.pitch = data.pitch || player.pitch;
+        }
+        break;
+        
+      case 'shoot':
+        this.handleShoot(playerId, player);
+        break;
+        
+      case 'chat':
+        const name = player.name || 'Unknown';
+        this.broadcastChat(name, data.text, playerId);
+        break;
+        
+      case 'ping':
+        ws.send(JSON.stringify({ type: 'pong' }));
+        break;
+    }
+  }
+
+  // ===== СТРЕЛЬБА =====
+  handleShoot(playerId, player) {
+    // Проверяем, жив ли игрок
+    if (player.health <= 0) return;
+    
+    // Рейкаст по всем игрокам
+    const origin = { x: player.x, z: player.z };
+    const angle = player.rotation;
+    const direction = { x: -Math.sin(angle), z: -Math.cos(angle) };
+    
+    let closestHit = null;
+    let closestDist = Infinity;
+    
+    for (const [id, target] of this.players) {
+      if (id === playerId) continue;
+      if (target.health <= 0) continue;
+      
+      // Проверка попадания в прямоугольник 0.7x0.5
+      const dx = target.x - origin.x;
+      const dz = target.z - origin.z;
+      
+      // Проекция на направление
+      const proj = dx * direction.x + dz * direction.z;
+      if (proj < 0 || proj > 15) continue; // Макс дистанция 15
+      
+      // Перпендикулярное расстояние
+      const perpX = dx - proj * direction.x;
+      const perpZ = dz - proj * direction.z;
+      const perpDist = Math.hypot(perpX, perpZ);
+      
+      if (perpDist < 0.8) { // Ширина игрока ~0.7
+        if (proj < closestDist) {
+          closestDist = proj;
+          closestHit = id;
+        }
+      }
+    }
+    
+    // Наносим урон
+    if (closestHit) {
+      const target = this.players.get(closestHit);
+      if (target) {
+        target.health = Math.max(0, target.health - 25);
+        
+        // Если игрок умер, телепортируем
+        if (target.health <= 0) {
+          const spawn = this.getRandomSpawn();
+          target.x = spawn.x;
+          target.z = spawn.z;
+          target.health = 100;
+        }
+      }
+    }
+    
+    this.broadcastDelta();
+  }
+
+  // ===== РАССЫЛКА =====
+  broadcastDelta() {
+    const data = {
+      type: 'delta',
+      players: this.getPlayersDelta(),
+      objects: this.objects,
+      tps: this.tps
+    };
+    
+    const message = JSON.stringify(data);
+    for (const [ws] of this.sessions) {
+      try {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(message);
+        }
+      } catch (e) {
+        // Игнорируем ошибки отправки
+      }
+    }
+  }
+
+  broadcastChat(name, text, senderId) {
+    const message = JSON.stringify({
+      type: 'chat',
+      name: name,
+      text: text,
+      id: senderId
+    });
+    
+    for (const [ws] of this.sessions) {
+      try {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(message);
+        }
       } catch (e) {}
     }
   }
 
-  // ===== ИГРОВОЙ ЦИКЛ =====
-  gameTick() {
-    const now = Date.now();
-    this.tickCount++;
-    
-    // Расчет TPS
-    if (now - this.lastTickTime >= 1000) {
-      this.currentTPS = this.tickCount;
-      this.tickCount = 0;
-      this.lastTickTime = now;
-    }
-    
-    // 1. Отправка ДЕЛЬТА-ОБНОВЛЕНИЙ (движения)
-    if (this.moveBuffer.length > 0) {
-      const moves = this.moveBuffer.splice(0, this.moveBuffer.length);
-      
-      // Группируем по игрокам (берем последнее значение)
-      const grouped = {};
-      for (const move of moves) {
-        if (!grouped[move.id] || move.time > grouped[move.id].time) {
-          grouped[move.id] = {
-            id: move.id,
-            x: move.x,
-            z: move.z,
-            rotation: move.rotation,
-            pitch: move.pitch
-          };
-        }
-      }
-      
-      // Отправляем как delta (клиент ждет такой формат)
-      this.broadcast({
-        type: 'delta',
-        players: grouped,
-        objects: [],
-        tps: this.currentTPS,
-        timestamp: now,
-        serverTime: now
-      });
-    }
-    
-    // 2. Отправка СНАПШОТОВ (полное состояние)
-    if (now - this.lastSnapshot >= this.config.snapshotInterval) {
-      const state = this.compressState();
-      this.broadcast({
-        type: 'state',
-        players: state.players,
-        objects: state.objects,
-        tps: this.currentTPS,
-        timestamp: now,
-        serverTime: now
-      });
-      this.lastSnapshot = now;
-    }
-    
-    // 3. Heartbeat
-    if (this.tickCount % Math.round(this.config.tickRate / this.config.heartbeatRate) === 0) {
-      this.broadcast({
-        type: 'heartbeat',
-        timestamp: now,
-        serverTime: now,
-        players: this.players.size
-      });
-    }
-    
-    // 4. Очистка
-    if (now - this.lastCleanup > this.config.cleanupInterval) {
-      this.cleanupAllPlayers();
-      this.lastCleanup = now;
-    }
-    
-    // 5. Проверка соединений
-    this.checkConnections();
-    
-    // 6. Остановка
-    if (this.players.size === 0) {
-      this.stopGameLoop();
-    }
-  }
-
-  // ===== ПРОВЕРКА СОЕДИНЕНИЙ =====
-  checkConnections() {
-    const now = Date.now();
-    const timeout = 30000;
-    const wsSockets = this.ctx.getWebSockets();
-    const activePlayers = new Set();
-    
-    for (const ws of wsSockets) {
-      try {
-        const wsData = this.wsCache.get(ws);
-        if (wsData?.playerId) {
-          activePlayers.add(wsData.playerId);
-          
-          if (now - wsData.lastActivity > timeout) {
-            this.wsCache.delete(ws);
-            ws.close(1000, 'Connection timeout');
-          }
-        }
-      } catch (error) {}
-    }
-    
-    // Обновляем статус
+  // ===== ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ =====
+  getPlayersData() {
+    const result = {};
     for (const [id, player] of this.players) {
-      const isActive = activePlayers.has(id);
-      player.wsConnected = isActive;
-      
-      if (isActive) {
-        player.lastUpdate = now;
-      }
+      result[id] = { ...player };
     }
-    
-    // Удаляем неактивных
-    if (this.players.size > activePlayers.size) {
-      const staleTimeout = 10000;
-      const stalePlayers = [];
-      
-      for (const [id, player] of this.players) {
-        if (!player.wsConnected && (now - player.lastUpdate > staleTimeout)) {
-          stalePlayers.push(id);
-        }
-      }
-      
-      if (stalePlayers.length > 0) {
-        for (const id of stalePlayers) {
-          this.players.delete(id);
-          this.playerCache.delete(id);
-        }
-        this.saveState();
-      }
-    }
+    return result;
   }
 
-  // ===== ОЧИСТКА =====
-  async cleanupAllPlayers() {
-    const now = Date.now();
-    const wsSockets = this.ctx.getWebSockets();
-    const activePlayers = new Set();
-    
-    for (const ws of wsSockets) {
-      try {
-        const wsData = this.wsCache.get(ws);
-        if (wsData?.playerId) {
-          activePlayers.add(wsData.playerId);
-        }
-      } catch (error) {}
-    }
-    
-    const removed = [];
+  getPlayersDelta() {
+    const result = {};
     for (const [id, player] of this.players) {
-      const isActive = activePlayers.has(id);
-      const isStale = now - player.lastUpdate > 10000;
-      const isInactive = now - player.lastActivity > 30000;
-      
-      if (!isActive || isStale || isInactive) {
-        removed.push(id);
-      }
+      result[id] = {
+        x: player.x,
+        z: player.z,
+        rotation: player.rotation,
+        pitch: player.pitch,
+        health: player.health
+      };
     }
-    
-    if (removed.length > 0) {
-      for (const id of removed) {
-        this.players.delete(id);
-        this.playerCache.delete(id);
-      }
-      await this.saveState();
-      console.log(`[Cleanup] Removed ${removed.length} players`);
-    }
-    
-    return removed;
+    return result;
   }
 
-  // ===== WEBSOCKET СОБЫТИЯ =====
-  webSocketClose(ws) {
-    try {
-      const wsData = this.wsCache.get(ws);
-      if (wsData?.playerId) {
-        const player = this.players.get(wsData.playerId);
-        if (player) {
-          player.wsConnected = false;
-          player.lastUpdate = Date.now();
-          console.log(`[WebSocket] Player ${wsData.playerId} disconnected`);
-        }
-        this.wsCache.delete(ws);
-      }
-    } catch (error) {
-      console.error('[WebSocket] Close error:', error);
-    }
-    
-    setTimeout(() => this.cleanupAllPlayers(), 1000);
+  getRandomSpawn() {
+    const angle = Math.random() * Math.PI * 2;
+    const radius = 3 + Math.random() * 5;
+    return {
+      x: Math.cos(angle) * radius,
+      z: Math.sin(angle) * radius
+    };
   }
 
-  webSocketError(ws, error) {
-    console.error('[WebSocket] Error:', error);
-    this.webSocketClose(ws);
+  async saveState() {
+    const data = {
+      players: Object.fromEntries(this.players),
+      objects: this.objects
+    };
+    await this.state.storage.put('state', data);
   }
 
-  // ===== HTTP =====
-  async fetch(request) {
-    const url = new URL(request.url);
-    
-    try {
-      if (url.pathname === '/ws') {
-        return this.handleWebSocket();
-      }
-      
-      if (url.pathname === '/reset') {
-        this.players.clear();
-        await this.saveState();
-        for (const ws of this.ctx.getWebSockets()) {
-          try { ws.close(1000, 'Reset'); } catch (e) {}
-        }
-        this.stopGameLoop();
-        this.startGameLoop();
-        return new Response(JSON.stringify({ success: true }), {
-          headers: { 'Content-Type': 'application/json' }
-        });
-      }
-      
-      if (url.pathname === '/stats') {
-        return new Response(JSON.stringify({
-          tps: this.currentTPS,
-          players: this.players.size,
-          objects: this.objects.length,
-          wsConnections: this.ctx.getWebSockets().length,
-          avgPing: Array.from(this.players.values()).reduce((a, p) => a + p.ping, 0) / (this.players.size || 1)
-        }), {
-          headers: { 'Content-Type': 'application/json' }
-        });
-      }
-      
-      if (url.pathname === '/debug') {
-        return new Response(JSON.stringify({
-          players: Array.from(this.players.keys()),
-          wsConnections: this.ctx.getWebSockets().length,
-          objects: this.objects.length,
-          tickInterval: !!this.tickInterval,
-          currentTPS: this.currentTPS,
-          moveBuffer: this.moveBuffer.length
-        }), {
-          headers: { 'Content-Type': 'application/json' }
-        });
-      }
-      
-      return new Response('Game Server Running', { status: 200 });
-    } catch (error) {
-      console.error('[HTTP] Error:', error);
-      return new Response('Error', { status: 500 });
+  // Очистка при остановке
+  async dispose() {
+    if (this.tickInterval) {
+      clearInterval(this.tickInterval);
     }
+    await this.saveState();
   }
 }
 
@@ -682,21 +290,25 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     
-    try {
-      // Корневой путь
-      if (url.pathname === '/' || url.pathname === '') {
-        return new Response('DO Shooter Server Running', {
-          status: 200,
-          headers: { 'Content-Type': 'text/plain' }
-        });
+    // WebSocket endpoint
+    if (url.pathname === '/ws') {
+      const upgrade = await env.ROOM.getWebSocket(request);
+      if (upgrade) {
+        const room = env.ROOM.get(env.ROOM.idFromName('main'));
+        await room.initialize();
+        room.handleWebSocket(upgrade);
+        return new Response(null, { status: 101, webSocket: upgrade });
       }
-      
-      const id = env.GAME_ROOM.idFromName('main');
-      const room = env.GAME_ROOM.get(id);
-      return room.fetch(request);
-    } catch (error) {
-      console.error('[Worker] Error:', error);
-      return new Response('Internal Server Error', { status: 500 });
+      return new Response('WebSocket upgrade failed', { status: 400 });
     }
+    
+    // Статус
+    if (url.pathname === '/status') {
+      return new Response(JSON.stringify({ status: 'ok' }), {
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+    
+    return new Response('Not found', { status: 404 });
   }
 };
