@@ -1,360 +1,337 @@
-// server.js - Полностью рабочий сервер для Cloudflare Workers с Durable Object
+// server.js - Полностью рабочий сервер для локального запуска с WebSocket
 
-// ===== DURABLE OBJECT =====
-export class GameRoom {
-  constructor(state, env) {
-    this.state = state;
-    this.env = env;
-    this.players = new Map();
-    this.objects = [];
-    this.sessions = new Map();
-    this.tickInterval = null;
-    this.tickCount = 0;
-    this.tps = 0;
-    this.lastTpsUpdate = Date.now();
-    this.playerNames = new Map();
-    this.initialized = false;
-  }
+const express = require('express');
+const http = require('http');
+const WebSocket = require('ws');
+const cors = require('cors');
+const crypto = require('crypto');
 
-  async initialize() {
-    if (this.initialized) return;
-    this.initialized = true;
-    
-    try {
-      const stored = await this.state.storage.get('state');
-      if (stored) {
-        this.players = new Map(Object.entries(stored.players || {}));
-        this.objects = stored.objects || [];
-      }
-    } catch (e) {
-      console.error('Storage error:', e);
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ 
+  server,
+  path: '/ws',
+  clientTracking: true
+});
+
+// ===== ИГРОВОЕ СОСТОЯНИЕ =====
+const gameState = {
+  players: new Map(),     // playerId -> playerData
+  playerNames: new Map(), // playerId -> name
+  sessions: new Map(),    // ws -> playerId
+  objects: [],
+  tickCount: 0,
+  tps: 0,
+  lastTpsUpdate: Date.now(),
+  tickInterval: null
+};
+
+// ===== ГЕНЕРАЦИЯ ИМЕНИ =====
+const adjectives = ['Быстрый', 'Смелый', 'Храбрый', 'Мудрый', 'Ловкий', 'Сильный', 'Тихий', 'Громкий', 'Яркий', 'Тёмный'];
+const nouns = ['Волк', 'Лис', 'Медведь', 'Орёл', 'Тигр', 'Дракон', 'Сокол', 'Кот', 'Пёс', 'Лев'];
+
+function generateName() {
+  return `${adjectives[Math.floor(Math.random() * adjectives.length)]}${nouns[Math.floor(Math.random() * nouns.length)]}`;
+}
+
+// ===== ИНИЦИАЛИЗАЦИЯ =====
+function initializeGame() {
+  if (gameState.tickInterval) return;
+  
+  gameState.tickInterval = setInterval(() => gameTick(), 50);
+  
+  setInterval(() => {
+    const now = Date.now();
+    const delta = (now - gameState.lastTpsUpdate) / 1000;
+    if (delta > 0) {
+      gameState.tps = Math.round(gameState.tickCount / delta);
+      gameState.tickCount = 0;
+      gameState.lastTpsUpdate = now;
     }
-    
-    this.tickInterval = setInterval(() => this.gameTick(), 50);
-    
-    setInterval(() => {
-      const now = Date.now();
-      const delta = (now - this.lastTpsUpdate) / 1000;
-      if (delta > 0) {
-        this.tps = Math.round(this.tickCount / delta);
-        this.tickCount = 0;
-        this.lastTpsUpdate = now;
-      }
-    }, 1000);
-  }
+  }, 1000);
+  
+  console.log('Game initialized');
+}
 
-  gameTick() {
-    this.tickCount++;
-    
-    // Восстановление здоровья
-    for (const [id, player] of this.players) {
-      if (player.health < 100) {
-        player.health = Math.min(100, player.health + 0.5);
-      }
-    }
-    
-    this.broadcastDelta();
-  }
-
-  async handleWebSocket(ws) {
-    try {
-      const playerId = crypto.randomUUID();
-      const name = `Player${Math.floor(Math.random() * 1000)}`;
-      this.playerNames.set(playerId, name);
-      
-      const spawnPos = this.getRandomSpawn();
-      const player = {
-        x: spawnPos.x,
-        z: spawnPos.z,
-        y: 0,
-        rotation: 0,
-        pitch: 0,
-        health: 100,
-        name: name
-      };
-      
-      this.players.set(playerId, player);
-      this.sessions.set(ws, playerId);
-      
-      await this.saveState();
-      
-      // Отправляем инициализацию
-      ws.send(JSON.stringify({
-        type: 'init',
-        playerId: playerId,
-        players: this.getPlayersData(),
-        objects: this.objects,
-        tps: this.tps
-      }));
-      
-      ws.addEventListener('message', async (event) => {
-        try {
-          const data = JSON.parse(event.data);
-          await this.handleMessage(ws, data);
-        } catch (e) {
-          console.error('Message error:', e);
-        }
-      });
-      
-      ws.addEventListener('close', () => {
-        this.players.delete(playerId);
-        this.sessions.delete(ws);
-        this.playerNames.delete(playerId);
-        this.saveState();
-        this.broadcastDelta();
-      });
-      
-      ws.addEventListener('error', () => {
-        this.players.delete(playerId);
-        this.sessions.delete(ws);
-        this.playerNames.delete(playerId);
-      });
-    } catch (e) {
-      console.error('WebSocket error:', e);
-      ws.close();
+// ===== ИГРОВОЙ ТИК =====
+function gameTick() {
+  gameState.tickCount++;
+  
+  // Восстановление здоровья
+  for (const [id, player] of gameState.players) {
+    if (player.health < 100) {
+      player.health = Math.min(100, player.health + 0.5);
     }
   }
+  
+  broadcastDelta();
+}
 
-  async handleMessage(ws, data) {
-    const playerId = this.sessions.get(ws);
-    if (!playerId) return;
-    
-    const player = this.players.get(playerId);
-    if (!player) return;
-    
-    switch(data.type) {
-      case 'move':
-        const dx = data.x - player.x;
-        const dz = data.z - player.z;
-        const dist = Math.hypot(dx, dz);
-        
-        if (dist < 0.5) {
-          player.x = data.x;
-          player.z = data.z;
-          player.rotation = data.rotation || player.rotation;
-          player.pitch = data.pitch || player.pitch;
-        }
-        break;
-        
-      case 'shoot':
-        this.handleShoot(playerId, player);
-        break;
-        
-      case 'chat':
-        const name = this.playerNames.get(playerId) || 'Unknown';
-        this.broadcastChat(name, data.text, playerId);
-        break;
-        
-      case 'ping':
-        ws.send(JSON.stringify({ type: 'pong' }));
-        break;
-    }
-  }
+// ===== ПОЛУЧЕНИЕ ПОЗИЦИИ СПАВНА =====
+function getRandomSpawn() {
+  const angle = Math.random() * Math.PI * 2;
+  const radius = 3 + Math.random() * 5;
+  return {
+    x: Math.cos(angle) * radius,
+    z: Math.sin(angle) * radius
+  };
+}
 
-  handleShoot(playerId, player) {
-    if (player.health <= 0) return;
+// ===== ОБРАБОТКА ВЕБСОКЕТА =====
+function handleWebSocket(ws) {
+  try {
+    const playerId = crypto.randomUUID();
+    const name = generateName();
+    gameState.playerNames.set(playerId, name);
     
-    const origin = { x: player.x, z: player.z };
-    const angle = player.rotation;
-    const direction = { x: -Math.sin(angle), z: -Math.cos(angle) };
-    
-    let closestHit = null;
-    let closestDist = Infinity;
-    
-    for (const [id, target] of this.players) {
-      if (id === playerId) continue;
-      if (target.health <= 0) continue;
-      
-      const dx = target.x - origin.x;
-      const dz = target.z - origin.z;
-      
-      const proj = dx * direction.x + dz * direction.z;
-      if (proj < 0 || proj > 15) continue;
-      
-      const perpX = dx - proj * direction.x;
-      const perpZ = dz - proj * direction.z;
-      const perpDist = Math.hypot(perpX, perpZ);
-      
-      if (perpDist < 0.8) {
-        if (proj < closestDist) {
-          closestDist = proj;
-          closestHit = id;
-        }
-      }
-    }
-    
-    if (closestHit) {
-      const target = this.players.get(closestHit);
-      if (target) {
-        target.health = Math.max(0, target.health - 25);
-        
-        if (target.health <= 0) {
-          const spawn = this.getRandomSpawn();
-          target.x = spawn.x;
-          target.z = spawn.z;
-          target.health = 100;
-        }
-      }
-    }
-    
-    this.broadcastDelta();
-  }
-
-  broadcastDelta() {
-    const data = {
-      type: 'delta',
-      players: this.getPlayersDelta(),
-      objects: this.objects,
-      tps: this.tps
+    const spawnPos = getRandomSpawn();
+    const player = {
+      id: playerId,
+      x: spawnPos.x,
+      z: spawnPos.z,
+      y: 0,
+      rotation: 0,
+      pitch: 0,
+      health: 100,
+      name: name
     };
     
-    const message = JSON.stringify(data);
-    for (const [ws] of this.sessions) {
+    gameState.players.set(playerId, player);
+    gameState.sessions.set(ws, playerId);
+    
+    console.log(`Player ${name} (${playerId}) connected`);
+    
+    // Отправка инициализации
+    ws.send(JSON.stringify({
+      type: 'init',
+      playerId: playerId,
+      players: getPlayersData(),
+      objects: gameState.objects,
+      tps: gameState.tps
+    }));
+    
+    ws.on('message', (rawData) => {
       try {
-        if (ws.readyState === 1) { // WebSocket.OPEN
-          ws.send(message);
-        }
+        const data = JSON.parse(rawData.toString());
+        handleMessage(ws, data);
       } catch (e) {
-        // Игнорируем ошибки отправки
+        console.error('Message parse error:', e);
       }
-    }
-  }
-
-  broadcastChat(name, text, senderId) {
-    const message = JSON.stringify({
-      type: 'chat',
-      name: name,
-      text: text,
-      id: senderId
     });
     
-    for (const [ws] of this.sessions) {
-      try {
-        if (ws.readyState === 1) { // WebSocket.OPEN
-          ws.send(message);
-        }
-      } catch (e) {
-        // Игнорируем ошибки отправки
-      }
-    }
-  }
-
-  getPlayersData() {
-    const result = {};
-    for (const [id, player] of this.players) {
-      result[id] = { ...player };
-    }
-    return result;
-  }
-
-  getPlayersDelta() {
-    const result = {};
-    for (const [id, player] of this.players) {
-      result[id] = {
-        x: player.x,
-        z: player.z,
-        rotation: player.rotation,
-        pitch: player.pitch,
-        health: player.health
-      };
-    }
-    return result;
-  }
-
-  getRandomSpawn() {
-    const angle = Math.random() * Math.PI * 2;
-    const radius = 3 + Math.random() * 5;
-    return {
-      x: Math.cos(angle) * radius,
-      z: Math.sin(angle) * radius
-    };
-  }
-
-  async saveState() {
-    try {
-      const data = {
-        players: Object.fromEntries(this.players),
-        objects: this.objects
-      };
-      await this.state.storage.put('state', data);
-    } catch (e) {
-      console.error('Save state error:', e);
-    }
-  }
-
-  async dispose() {
-    if (this.tickInterval) {
-      clearInterval(this.tickInterval);
-    }
-    await this.saveState();
+    ws.on('close', () => {
+      const name = gameState.playerNames.get(playerId) || 'Unknown';
+      console.log(`Player ${name} (${playerId}) disconnected`);
+      gameState.players.delete(playerId);
+      gameState.sessions.delete(ws);
+      gameState.playerNames.delete(playerId);
+      broadcastDelta();
+    });
+    
+    ws.on('error', (error) => {
+      console.error('WebSocket error:', error);
+    });
+    
+  } catch (e) {
+    console.error('WebSocket handler error:', e);
+    ws.close();
   }
 }
 
-// ===== WORKER =====
-export default {
-  async fetch(request, env) {
-    const url = new URL(request.url);
+// ===== ОБРАБОТКА СООБЩЕНИЙ =====
+function handleMessage(ws, data) {
+  const playerId = gameState.sessions.get(ws);
+  if (!playerId) return;
+  
+  const player = gameState.players.get(playerId);
+  if (!player) return;
+  
+  switch(data.type) {
+    case 'move':
+      const dx = data.x - player.x;
+      const dz = data.z - player.z;
+      const dist = Math.hypot(dx, dz);
+      
+      if (dist < 0.5) {
+        player.x = data.x;
+        player.z = data.z;
+        player.rotation = data.rotation || player.rotation;
+        player.pitch = data.pitch || player.pitch;
+      }
+      break;
+      
+    case 'shoot':
+      handleShoot(playerId, player);
+      break;
+      
+    case 'chat':
+      const name = gameState.playerNames.get(playerId) || 'Unknown';
+      broadcastChat(name, data.text, playerId);
+      break;
+      
+    case 'ping':
+      ws.send(JSON.stringify({ type: 'pong' }));
+      break;
+  }
+}
+
+// ===== СТРЕЛЬБА =====
+function handleShoot(playerId, player) {
+  if (player.health <= 0) return;
+  
+  const origin = { x: player.x, z: player.z };
+  const angle = player.rotation;
+  const direction = { x: -Math.sin(angle), z: -Math.cos(angle) };
+  
+  let closestHit = null;
+  let closestDist = Infinity;
+  
+  for (const [id, target] of gameState.players) {
+    if (id === playerId) continue;
+    if (target.health <= 0) continue;
     
-    // Обработка CORS для всех запросов
-    const corsHeaders = {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type',
-    };
+    const dx = target.x - origin.x;
+    const dz = target.z - origin.z;
     
-    if (request.method === 'OPTIONS') {
-      return new Response(null, {
-        headers: corsHeaders,
-      });
-    }
+    const proj = dx * direction.x + dz * direction.z;
+    if (proj < 0 || proj > 15) continue;
     
-    // WebSocket endpoint
-    if (url.pathname === '/ws') {
-      try {
-        // Получаем Durable Object
-        const id = env.ROOM.idFromName('main');
-        const room = env.ROOM.get(id);
-        
-        // Инициализируем комнату
-        await room.initialize();
-        
-        // Создаем WebSocket пару
-        const [client, server] = Object.values(new WebSocketPair());
-        
-        // Передаем серверный WebSocket в Durable Object
-        room.handleWebSocket(server);
-        
-        // Возвращаем клиентский WebSocket
-        return new Response(null, {
-          status: 101,
-          webSocket: client,
-        });
-      } catch (e) {
-        console.error('WebSocket upgrade error:', e);
-        return new Response('WebSocket upgrade failed: ' + e.message, { 
-          status: 400,
-          headers: corsHeaders,
-        });
+    const perpX = dx - proj * direction.x;
+    const perpZ = dz - proj * direction.z;
+    const perpDist = Math.hypot(perpX, perpZ);
+    
+    if (perpDist < 0.8) {
+      if (proj < closestDist) {
+        closestDist = proj;
+        closestHit = id;
       }
     }
-    
-    // Статус
-    if (url.pathname === '/status') {
-      return new Response(JSON.stringify({ 
-        status: 'ok',
-        timestamp: Date.now(),
-        environment: env.ENVIRONMENT || 'development'
-      }), {
-        headers: {
-          'Content-Type': 'application/json',
-          ...corsHeaders
-        }
-      });
+  }
+  
+  if (closestHit) {
+    const target = gameState.players.get(closestHit);
+    if (target) {
+      target.health = Math.max(0, target.health - 25);
+      
+      if (target.health <= 0) {
+        const spawn = getRandomSpawn();
+        target.x = spawn.x;
+        target.z = spawn.z;
+        target.health = 100;
+      }
     }
-    
-    return new Response('Not found', { 
-      status: 404,
-      headers: corsHeaders
+  }
+  
+  broadcastDelta();
+}
+
+// ===== РАССЫЛКА =====
+function broadcastDelta() {
+  const data = {
+    type: 'delta',
+    players: getPlayersDelta(),
+    objects: gameState.objects,
+    tps: gameState.tps
+  };
+  
+  const message = JSON.stringify(data);
+  for (const [ws] of gameState.sessions) {
+    try {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(message);
+      }
+    } catch (e) {
+      // Игнорируем
+    }
+  }
+}
+
+function broadcastChat(name, text, senderId) {
+  const message = JSON.stringify({
+    type: 'chat',
+    name: name,
+    text: text,
+    id: senderId
+  });
+  
+  for (const [ws] of gameState.sessions) {
+    try {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(message);
+      }
+    } catch (e) {
+      // Игнорируем
+    }
+  }
+}
+
+function getPlayersData() {
+  const result = {};
+  for (const [id, player] of gameState.players) {
+    result[id] = { ...player };
+    delete result[id].id; // Убираем дублирование id
+  }
+  return result;
+}
+
+function getPlayersDelta() {
+  const result = {};
+  for (const [id, player] of gameState.players) {
+    result[id] = {
+      x: player.x,
+      z: player.z,
+      rotation: player.rotation,
+      pitch: player.pitch,
+      health: player.health
+    };
+  }
+  return result;
+}
+
+// ===== HTTP РОУТЫ =====
+app.get('/status', (req, res) => {
+  res.json({
+    status: 'ok',
+    players: gameState.players.size,
+    tps: gameState.tps,
+    timestamp: Date.now()
+  });
+});
+
+app.get('/players', (req, res) => {
+  const players = [];
+  for (const [id, player] of gameState.players) {
+    players.push({
+      id,
+      name: gameState.playerNames.get(id) || 'Unknown',
+      x: player.x,
+      z: player.z,
+      health: player.health
     });
   }
-};
+  res.json(players);
+});
+
+// ===== ЗАПУСК =====
+const PORT = process.env.PORT || 3000;
+
+server.listen(PORT, () => {
+  console.log(`🚀 Server running on http://localhost:${PORT}`);
+  console.log(`📡 WebSocket endpoint: ws://localhost:${PORT}/ws`);
+  console.log(`📊 Status: http://localhost:${PORT}/status`);
+  initializeGame();
+});
+
+// Обработка закрытия
+process.on('SIGINT', () => {
+  if (gameState.tickInterval) {
+    clearInterval(gameState.tickInterval);
+  }
+  server.close(() => {
+    console.log('Server closed');
+    process.exit(0);
+  });
+});
