@@ -9,7 +9,6 @@ export class GameRoom {
     this.id = ctx.id.toString();
     this.tickInterval = null;
     
-    // Счетчик TPS
     this.tickCount = 0;
     this.lastTickTime = Date.now();
     this.currentTPS = 0;
@@ -61,10 +60,11 @@ export class GameRoom {
         rotation: 0,
         health: 100,
         ping: 0,
-        // Добавляем данные для предсказания
         lastMoveTime: Date.now(),
         speedX: 0,
-        speedZ: 0
+        speedZ: 0,
+        // Добавляем очередь команд для лучшей синхронизации
+        inputQueue: []
       };
       
       await this.storage.put('state', {
@@ -79,11 +79,11 @@ export class GameRoom {
         playerId,
         players: this.players,
         objects: this.objects,
-        tps: 30 // Увеличили TPS
+        tps: 30,
+        serverTime: Date.now()
       }));
       
       if (!this.tickInterval) {
-        // Тик каждые 33 мс (30 TPS) вместо 50 мс
         this.tickInterval = setInterval(() => this.gameTick(), 33);
         this.lastTickTime = Date.now();
         this.tickCount = 0;
@@ -114,7 +114,6 @@ export class GameRoom {
     
     const player = this.players[playerId];
     
-    // Обработка пинга
     if (data.type === 'ping') {
       const now = Date.now();
       const ping = now - (attachment.lastPingTime || now);
@@ -123,7 +122,8 @@ export class GameRoom {
       ws.send(JSON.stringify({
         type: 'pong',
         ping: ping,
-        timestamp: now
+        timestamp: now,
+        serverTime: now
       }));
       
       return;
@@ -131,7 +131,6 @@ export class GameRoom {
     
     switch(data.type) {
       case 'move':
-        // Используем реальное время для расчета движения
         const now = Date.now();
         const deltaTime = Math.min((now - (player.lastMoveTime || now)) / 1000, 0.05);
         player.lastMoveTime = now;
@@ -139,43 +138,35 @@ export class GameRoom {
         player.rotation = data.rotation || 0;
         
         if (data.keys) {
-          // Увеличили скорость и используем deltaTime
           const speed = 5.5 * deltaTime;
           let dx = 0, dz = 0;
           
-          // Движение вперед/назад относительно поворота
           if (data.keys.w) { dx += Math.sin(player.rotation) * speed; dz += Math.cos(player.rotation) * speed; }
           if (data.keys.s) { dx -= Math.sin(player.rotation) * speed; dz -= Math.cos(player.rotation) * speed; }
-          
-          // Движение влево/вправо (страф)
           if (data.keys.a) { dx += Math.sin(player.rotation - Math.PI/2) * speed * 0.8; dz += Math.cos(player.rotation - Math.PI/2) * speed * 0.8; }
           if (data.keys.d) { dx += Math.sin(player.rotation + Math.PI/2) * speed * 0.8; dz += Math.cos(player.rotation + Math.PI/2) * speed * 0.8; }
           
-          // Если есть предсказанная позиция от клиента, используем её
+          // Полностью доверяем клиенту для плавности
           if (data.predictedX !== undefined && data.predictedZ !== undefined) {
-            // Проверяем расхождение, но доверяем клиенту
             const dist = Math.hypot(data.predictedX - player.x, data.predictedZ - player.z);
-            if (dist < 0.5) {
-              // Мягкая коррекция, доверяем клиенту
-              player.x += (data.predictedX - player.x) * 0.3;
-              player.z += (data.predictedZ - player.z) * 0.3;
+            if (dist < 1.0) {
+              // Мягкая коррекция
+              player.x += (data.predictedX - player.x) * 0.15;
+              player.z += (data.predictedZ - player.z) * 0.15;
             } else {
-              // Если расхождение слишком большое, используем серверный расчет
+              // При большом расхождении используем серверный расчет
               player.x += dx;
               player.z += dz;
             }
           } else {
-            // Без предсказания от клиента
             player.x += dx;
             player.z += dz;
           }
           
-          // Запоминаем скорость для интерполяции на клиенте
           player.speedX = dx / deltaTime;
           player.speedZ = dz / deltaTime;
         }
         
-        // Ограничение границ
         player.x = Math.max(-30, Math.min(30, player.x));
         player.z = Math.max(-30, Math.min(30, player.z));
         break;
@@ -230,27 +221,21 @@ export class GameRoom {
       this.lastTickTime = now;
     }
     
-    // Отправляем состояние только если есть изменения или раз в 50 мс
     const state = {
       type: 'state',
       players: this.players,
       objects: this.objects,
       tps: this.currentTPS,
-      timestamp: now
+      timestamp: now,
+      serverTime: now
     };
     
     const message = JSON.stringify(state);
     const sockets = this.ctx.getWebSockets();
     
-    // Отправляем всем, но с задержкой для уменьшения нагрузки
-    sockets.forEach((ws, index) => {
+    sockets.forEach((ws) => {
       try {
-        // Добавляем небольшую задержку для разных клиентов
-        setTimeout(() => {
-          try {
-            ws.send(message);
-          } catch(e) {}
-        }, index * 2);
+        ws.send(message);
       } catch(e) {}
     });
   }
