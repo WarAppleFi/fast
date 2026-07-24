@@ -4,7 +4,6 @@ export class GameRoom {
     this.env = env;
     this.clients = new Map();
     this.players = new Map();
-    this.bullets = [];
     this.tickCounter = 0;
     this.tickInterval = 1000 / 60;
     this.heartbeat = null;
@@ -29,7 +28,8 @@ export class GameRoom {
       x: Math.random() * 700 + 50,
       y: Math.random() * 500 + 50,
       health: 100,
-      angle: 0
+      angle: 0,
+      size: 30 // размер куба
     };
 
     this.clients.set(id, { ws: server });
@@ -64,7 +64,8 @@ export class GameRoom {
       x: Math.round(p.x),
       y: Math.round(p.y),
       health: p.health,
-      angle: p.angle
+      angle: p.angle,
+      size: p.size
     }));
 
     server.send(JSON.stringify({
@@ -95,7 +96,8 @@ export class GameRoom {
         x: Math.round(player.x),
         y: Math.round(player.y),
         health: player.health,
-        angle: player.angle
+        angle: player.angle,
+        size: player.size
       };
     }
 
