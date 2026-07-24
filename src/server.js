@@ -1,69 +1,111 @@
-// ===== src/server.js =====
-// РАБОТАЕТ В CLOUDFLARE WORKERS БЕЗ ВНЕШНИХ ЗАВИСИМОСТЕЙ
+// server.js - Colyseus сервер для Cloudflare Durable Objects
+import { Server, Room } from 'colyseus';
+import { WebSocketTransport } from '@colyseus/ws-transport';
 
-/**
- * DURABLE OBJECT - ИГРОВАЯ КОМНАТА
- */
-export class GameRoom {
-  constructor(ctx, env) {
-    this.ctx = ctx;
-    this.env = env;
-    this.storage = ctx.storage;
-    this.id = ctx.id.toString();
+// ===== DURABLE OBJECT ROOM =====
+export class GameRoom extends Room {
+  constructor() {
+    super();
     
-    // ===== ОПТИМИЗИРОВАННЫЕ СТРУКТУРЫ =====
+    // Оптимизированные структуры данных
     this.players = new Map();
     this.objects = [];
-    this.wsMap = new Map(); // ws -> playerId
+    this.pendingUpdates = new Map();
     
-    // ===== НАСТРОЙКИ ДЛЯ ПЛАВНОГО ДВИЖЕНИЯ =====
+    // Настройки производительности
     this.config = {
-      tickRate: 30,        // тиков в секунду
-      stateSendRate: 20,   // полных состояний в секунду
+      tickRate: 60,
+      stateSendRate: 20,
+      heartbeatRate: 10,
+      cleanupInterval: 2000,
       maxPlayers: 50,
-      maxSpeed: 6,         // максимальная скорость
-      interpolationDelay: 50, // мс для интерполяции
+      maxObjects: 100,
       moveThreshold: 0.001,
-      cleanupInterval: 5000
+      interpolationDelay: 100
     };
     
-    // ===== СОСТОЯНИЕ =====
+    // Состояние
+    this.isInitialized = false;
+    this.tickInterval = null;
     this.lastTickTime = Date.now();
     this.tickCount = 0;
     this.currentTPS = 0;
-    this.timer = null;
     this.lastStateSend = 0;
     this.lastCleanup = 0;
     
-    // ===== БУФЕР ОБНОВЛЕНИЙ =====
+    // Оптимизация: буфер обновлений
     this.updateBuffer = [];
+    this.bufferSize = 0;
+    this.maxBufferSize = 100;
     
-    // Инициализация
-    this.initialize();
+    // Кэш для быстрого доступа
+    this.playerCache = new Map();
+    this.wsCache = new Map();
+    
+    // Colyseus специфичные поля
+    this.clock = null;
+    this.ctx = null;
+    this.env = null;
+    this.storage = null;
+    this.id = 'main';
   }
 
-  // ===== ИНИЦИАЛИЗАЦИЯ =====
+  // ===== Инициализация =====
+  async onCreate(options) {
+    console.log('GameRoom created', options);
+    
+    this.ctx = options.ctx;
+    this.env = options.env;
+    this.storage = this.ctx.storage;
+    this.id = this.ctx.id.toString();
+    
+    await this.initialize();
+    
+    // Настройка Colyseus
+    this.maxClients = this.config.maxPlayers;
+    this.setState({
+      players: {},
+      objects: [],
+      tps: 0,
+      timestamp: Date.now()
+    });
+    
+    // Запускаем игровой цикл через Colyseus
+    this.clock = this.clock || this.env.clock;
+    this.startGameLoop();
+  }
+
   async initialize() {
+    if (this.isInitialized) return;
+    this.isInitialized = true;
+    
     try {
       const saved = await this.storage.get('state');
       if (saved && saved.objects) {
         this.objects = saved.objects;
+        if (saved.players) {
+          for (const [id, data] of Object.entries(saved.players)) {
+            this.players.set(id, data);
+          }
+        }
+        console.log(`[GameRoom] Loaded ${this.objects.length} objects, ${this.players.size} players`);
       } else {
-        this.generateObjects();
+        if (this.objects.length === 0) {
+          this.generateObjects();
+        }
         await this.saveState();
       }
     } catch (error) {
-      console.error('[Init] Error:', error);
+      console.error('[GameRoom] Initialization error:', error);
       this.generateObjects();
+      await this.saveState();
     }
-    
-    this.startLoop();
-    console.log('[GameRoom] Ready');
   }
 
   generateObjects() {
     this.objects = [];
-    for (let i = 0; i < 20; i++) {
+    const count = Math.min(20, this.config.maxObjects);
+    for (let i = 0; i < count; i++) {
       this.objects.push({
         id: i,
         x: (Math.random() - 0.5) * 40,
@@ -75,486 +117,652 @@ export class GameRoom {
         color: Math.floor(Math.random() * 0xffffff)
       });
     }
+    this.updateState();
   }
 
   async saveState() {
     try {
-      await this.storage.put('state', {
-        objects: this.objects,
-        timestamp: Date.now()
-      });
+      const state = {
+        players: Object.fromEntries(this.players),
+        objects: this.objects
+      };
+      await this.storage.put('state', state);
     } catch (error) {
-      console.error('[Save] Error:', error);
+      console.error('[GameRoom] Save state error:', error);
     }
   }
 
-  // ===== ИГРОВОЙ ЦИКЛ =====
-  startLoop() {
-    if (this.timer) {
-      clearInterval(this.timer);
-    }
-    
-    this.timer = setInterval(() => this.tick(), 1000 / this.config.tickRate);
+  updateState() {
+    this.state.players = Object.fromEntries(this.players);
+    this.state.objects = this.objects;
+    this.state.tps = this.currentTPS;
+    this.state.timestamp = Date.now();
   }
 
-  tick() {
-    const now = Date.now();
-    this.tickCount++;
-    
-    // Расчет TPS
-    if (now - this.lastTickTime >= 1000) {
-      this.currentTPS = this.tickCount;
-      this.tickCount = 0;
-      this.lastTickTime = now;
+  startGameLoop() {
+    if (this.tickInterval) {
+      clearInterval(this.tickInterval);
     }
     
-    // Обработка буфера обновлений
-    this.processUpdates();
+    const tickInterval = 1000 / this.config.tickRate;
+    this.tickInterval = setInterval(() => this.gameTick(), tickInterval);
+    this.lastTickTime = Date.now();
+    this.tickCount = 0;
     
-    // Отправка состояния
-    if (now - this.lastStateSend > 1000 / this.config.stateSendRate) {
-      this.sendState();
-      this.lastStateSend = now;
-    }
-    
-    // Очистка
-    if (now - this.lastCleanup > this.config.cleanupInterval) {
-      this.cleanupPlayers();
-      this.lastCleanup = now;
-    }
-    
-    // Остановка если нет игроков
-    if (this.players.size === 0 && this.timer) {
-      clearInterval(this.timer);
-      this.timer = null;
+    console.log('[GameRoom] Game loop started');
+  }
+
+  stopGameLoop() {
+    if (this.tickInterval) {
+      clearInterval(this.tickInterval);
+      this.tickInterval = null;
+      console.log('[GameRoom] Game loop stopped');
     }
   }
 
-  // ===== ОБРАБОТКА ЗАПРОСОВ =====
-  async fetch(request) {
-    const url = new URL(request.url);
-    const path = url.pathname;
+  // ===== Colyseus методы =====
+  async onJoin(client, options) {
+    console.log('Player joined:', client.sessionId);
     
-    try {
-      if (path === '/ws') {
-        return this.handleWebSocket();
-      }
-      
-      if (path === '/stats') {
-        return this.handleStats();
-      }
-      
-      if (path === '/reset') {
-        return this.handleReset();
-      }
-      
-      return new Response('Not found', { status: 404 });
-    } catch (error) {
-      console.error('[Fetch] Error:', error);
-      return new Response('Error', { status: 500 });
-    }
-  }
-
-  // ===== WEBSOCKET =====
-  async handleWebSocket() {
     if (this.players.size >= this.config.maxPlayers) {
-      return new Response('Server full', { status: 429 });
+      client.leave(429, 'Server full');
+      return;
     }
     
-    const pair = new WebSocketPair();
-    const [client, server] = Object.values(pair);
-    
-    this.ctx.acceptWebSocket(server);
+    await this.cleanupAllPlayers();
     
     // Создаем игрока
-    const playerId = crypto.randomUUID();
+    const playerId = client.sessionId;
+    const startX = (Math.random() - 0.5) * 10;
+    const startZ = (Math.random() - 0.5) * 10;
+    
     const player = {
       id: playerId,
-      x: (Math.random() - 0.5) * 10,
-      z: (Math.random() - 0.5) * 10,
+      x: startX,
+      z: startZ,
       y: 0.5,
       rotation: 0,
       pitch: 0,
       health: 100,
-      // Для интерполяции
-      prevX: 0,
-      prevZ: 0,
-      prevR: 0,
-      targetX: 0,
-      targetZ: 0,
-      // Время
-      lastUpdate: Date.now(),
+      ping: 0,
       lastMoveTime: Date.now(),
+      connectedAt: Date.now(),
+      lastUpdate: Date.now(),
       lastActivity: Date.now(),
-      connectedAt: Date.now()
+      wsConnected: true,
+      isMoving: false,
+      speed: 0,
+      prevX: startX,
+      prevZ: startZ,
+      prevRotation: 0,
+      prevPitch: 0,
+      lastInterpolation: Date.now()
     };
     
     this.players.set(playerId, player);
-    this.wsMap.set(server, playerId);
+    this.playerCache.set(playerId, player);
+    this.wsCache.set(client, { playerId, lastPingTime: Date.now() });
     
     await this.saveState();
+    this.updateState();
     
-    // ===== ОТПРАВКА ИНИЦИАЛИЗАЦИИ =====
-    const initData = {
-      type: 'init',
-      playerId: playerId,
-      players: this.serializePlayers(),
-      objects: this.objects,
-      serverTime: Date.now(),
+    // Отправляем инициализацию новому игроку
+    client.send('init', {
+      playerId,
       config: {
         tickRate: this.config.tickRate,
         interpolationDelay: this.config.interpolationDelay,
-        maxSpeed: this.config.maxSpeed
-      }
-    };
-    
-    server.send(JSON.stringify(initData));
-    
-    // Уведомляем других
-    this.broadcastToOthers(server, {
-      type: 'player_joined',
-      id: playerId,
-      player: {
-        x: player.x,
-        z: player.z,
-        rotation: player.rotation,
-        health: player.health
-      }
+        moveThreshold: this.config.moveThreshold
+      },
+      serverTime: Date.now()
     });
     
-    console.log(`[WS] Player ${playerId} connected`);
+    // Отправляем полное состояние всем остальным
+    this.broadcastState();
     
-    return new Response(null, { status: 101, webSocket: client });
+    // Убеждаемся, что игровой цикл запущен
+    if (!this.tickInterval) {
+      this.startGameLoop();
+    }
   }
 
-  // ===== ОБРАБОТКА СООБЩЕНИЙ =====
-  async webSocketMessage(ws, message) {
+  async onLeave(client, consented) {
+    console.log('Player left:', client.sessionId);
+    
     try {
-      const data = JSON.parse(message);
-      const playerId = this.wsMap.get(ws);
-      
-      if (!playerId) {
-        ws.close(1000, 'Invalid');
+      const wsData = this.wsCache.get(client);
+      if (wsData && wsData.playerId) {
+        const player = this.players.get(wsData.playerId);
+        if (player) {
+          player.wsConnected = false;
+          player.lastUpdate = Date.now();
+        }
+        this.wsCache.delete(client);
+      }
+    } catch (error) {
+      console.error('[WebSocket] Close error:', error);
+    }
+    
+    // Запускаем очистку через некоторое время
+    setTimeout(() => {
+      this.cleanupAllPlayers();
+    }, 1000);
+  }
+
+  onMessage(client, message) {
+    try {
+      const wsData = this.wsCache.get(client);
+      if (!wsData || !wsData.playerId) {
+        console.warn('[Colyseus] Invalid connection');
+        client.leave(1000, 'Invalid connection');
         return;
       }
       
+      const playerId = wsData.playerId;
       const player = this.players.get(playerId);
+      
       if (!player) {
-        ws.close(1000, 'Not found');
+        console.warn(`[Colyseus] Player ${playerId} not found`);
+        client.leave(1000, 'Player not found');
         return;
       }
       
       const now = Date.now();
+      wsData.lastActivity = now;
       player.lastActivity = now;
       
-      switch (data.type) {
-        case 'move':
-          this.handleMove(player, data, now);
-          break;
+      // Обработка различных типов сообщений
+      switch (message.type) {
         case 'ping':
-          this.handlePing(ws, player, now);
+          this.handlePing(client, player, wsData, now);
           break;
+          
+        case 'move':
+          this.handleMove(player, message, now);
+          break;
+          
         case 'shoot':
-          this.handleShoot(player, data, now);
+          this.handleShoot(player, message, now);
           break;
+          
+        case 'chat':
+          this.handleChat(player, message, now);
+          break;
+          
+        case 'interact':
+          this.handleInteract(player, message, now);
+          break;
+          
         default:
-          console.log('[WS] Unknown type:', data.type);
+          console.warn(`[Colyseus] Unknown message type: ${message.type}`);
       }
+      
     } catch (error) {
-      console.error('[WS] Message error:', error);
+      console.error('[Colyseus] Message error:', error);
     }
   }
 
-  // ===== КЛЮЧЕВОЙ МЕТОД - ПЛАВНОЕ ДВИЖЕНИЕ =====
+  // ===== Обработчики сообщений =====
+  handlePing(client, player, wsData, now) {
+    const ping = now - (wsData.lastPingTime || now);
+    player.ping = Math.min(ping, 1000);
+    
+    client.send('pong', {
+      ping: player.ping,
+      timestamp: now,
+      serverTime: now
+    });
+    
+    wsData.lastPingTime = now;
+  }
+
   handleMove(player, data, now) {
     const deltaTime = Math.min((now - player.lastMoveTime) / 1000, 0.05);
     player.lastMoveTime = now;
     
-    // Сохраняем для интерполяции
     player.prevX = player.x;
     player.prevZ = player.z;
-    player.prevR = player.rotation || 0;
+    player.prevRotation = player.rotation || 0;
+    player.prevPitch = player.pitch || 0;
+    player.lastInterpolation = now;
     
-    // ===== ОБНОВЛЕНИЕ ПОЗИЦИИ С ОГРАНИЧЕНИЯМИ =====
+    let hasChanges = false;
+    const changes = { id: player.id };
+    
     if (data.x !== undefined && data.z !== undefined) {
-      // Ограничиваем картой
-      let newX = Math.max(-30, Math.min(30, data.x));
-      let newZ = Math.max(-30, Math.min(30, data.z));
+      const newX = Math.max(-30, Math.min(30, data.x));
+      const newZ = Math.max(-30, Math.min(30, data.z));
       
-      // Проверяем скорость (анти-чит)
       const dx = newX - player.x;
       const dz = newZ - player.z;
-      const distance = Math.sqrt(dx * dx + dz * dz);
-      const maxDelta = this.config.maxSpeed * deltaTime;
+      const distance = Math.sqrt(dx*dx + dz*dz);
       
-      if (distance > maxDelta) {
-        // Ограничиваем слишком быстрое движение
-        const ratio = maxDelta / distance;
-        newX = player.x + dx * ratio;
-        newZ = player.z + dz * ratio;
+      if (distance < 100) {
+        player.x = newX;
+        player.z = newZ;
+        player.isMoving = distance > 0.01;
+        player.speed = distance / deltaTime;
+        
+        changes.x = player.x;
+        changes.z = player.z;
+        hasChanges = true;
       }
-      
-      // ===== ПЛАВНАЯ ИНТЕРПОЛЯЦИЯ =====
-      const smoothness = 0.3; // Меньше = плавнее
-      player.x += (newX - player.x) * (1 - smoothness);
-      player.z += (newZ - player.z) * (1 - smoothness);
     }
     
-    // Обновляем поворот
     if (data.rotation !== undefined) {
       player.rotation = data.rotation;
+      changes.rotation = player.rotation;
+      hasChanges = true;
     }
     
     if (data.pitch !== undefined) {
       player.pitch = Math.max(-Math.PI/2, Math.min(Math.PI/2, data.pitch));
+      changes.pitch = player.pitch;
+      hasChanges = true;
     }
     
     player.lastUpdate = now;
+    player.wsConnected = true;
     
-    // Добавляем в буфер для отправки
-    this.addToBuffer('move', player.id, {
-      x: player.x,
-      z: player.z,
-      rotation: player.rotation,
-      pitch: player.pitch,
-      prevX: player.prevX,
-      prevZ: player.prevZ,
-      prevR: player.prevR,
-      timestamp: now
-    });
-  }
-
-  handlePing(ws, player, now) {
-    ws.send(JSON.stringify({
-      type: 'pong',
-      timestamp: now,
-      serverTime: now
-    }));
+    if (hasChanges && this.players.size > 1) {
+      this.queueUpdate('player', player.id, changes);
+      this.updateState();
+    }
   }
 
   handleShoot(player, data, now) {
-    // Простая стрельба
+    const cooldown = 150;
+    if (now - (player.lastShootTime || 0) < cooldown) return;
+    player.lastShootTime = now;
+    
     const rayX = player.x + Math.sin(player.rotation || 0) * 3;
     const rayZ = player.z + Math.cos(player.rotation || 0) * 3;
     
     let hit = false;
-    let hitId = null;
+    const objectUpdates = [];
     
-    for (const [id, target] of this.players) {
-      if (id === player.id) continue;
+    this.objects = this.objects.map(obj => {
+      const dx = obj.x - rayX;
+      const dz = obj.z - rayZ;
+      const distance = Math.sqrt(dx*dx + dz*dz);
       
-      const dx = target.x - rayX;
-      const dz = target.z - rayZ;
-      const dist = Math.sqrt(dx*dx + dz*dz);
-      
-      if (dist < 1.5) {
-        target.health = Math.max(0, target.health - 10);
+      if (distance < 2 && obj.h > 0) {
         hit = true;
-        hitId = id;
-        break;
+        const newH = Math.max(0, obj.h - 0.5);
+        objectUpdates.push({
+          id: obj.id,
+          h: newH,
+          x: obj.x,
+          z: obj.z,
+          y: obj.y
+        });
+        return { ...obj, h: newH };
       }
+      return obj;
+    });
+    
+    this.objects = this.objects.filter(obj => obj.h > 0);
+    
+    if (objectUpdates.length > 0) {
+      this.queueUpdate('objects', null, objectUpdates);
+      this.saveState();
+      this.updateState();
     }
     
-    this.broadcastMessage({
-      type: 'shoot_result',
+    this.broadcastMessage('shoot_result', {
       playerId: player.id,
       hit: hit,
-      target: hitId,
+      position: { x: player.x, z: player.z },
       timestamp: now
     });
   }
 
-  // ===== БУФЕР ОБНОВЛЕНИЙ =====
-  addToBuffer(type, id, data) {
-    this.updateBuffer.push({
+  handleChat(player, data, now) {
+    const name = player.id.slice(0, 6);
+    this.broadcastMessage('chat', {
+      id: player.id,
+      name: name,
+      text: (data.text || '').substring(0, 100),
+      timestamp: now
+    });
+  }
+
+  handleInteract(player, data, now) {
+    console.log(`[GameRoom] Player ${player.id} interacting`);
+  }
+
+  // ===== Система обновлений =====
+  queueUpdate(type, id, data) {
+    const update = {
       type,
       id,
       data,
       timestamp: Date.now()
-    });
+    };
     
-    // Ограничиваем размер буфера
-    if (this.updateBuffer.length > 100) {
-      this.updateBuffer = this.updateBuffer.slice(-50);
+    this.updateBuffer.push(update);
+    
+    if (this.updateBuffer.length > this.maxBufferSize) {
+      this.updateBuffer = this.updateBuffer.slice(-this.maxBufferSize);
     }
   }
 
   processUpdates() {
     if (this.updateBuffer.length === 0) return;
     
-    // Берем последние обновления
-    const updates = this.updateBuffer.splice(0, Math.min(this.updateBuffer.length, 30));
+    const updates = this.updateBuffer.splice(0, this.updateBuffer.length);
     
-    // Группируем по типу
-    const moves = {};
+    const playerUpdates = {};
+    const objectUpdates = [];
     
     for (const update of updates) {
-      if (update.type === 'move') {
-        moves[update.id] = {
-          ...(moves[update.id] || {}),
+      if (update.type === 'player') {
+        playerUpdates[update.id] = {
+          ...(playerUpdates[update.id] || {}),
           ...update.data
         };
+      } else if (update.type === 'objects') {
+        objectUpdates.push(...update.data);
       }
     }
     
-    // Отправляем сгруппированные обновления
-    if (Object.keys(moves).length > 0) {
-      this.sendDelta(moves);
+    if (Object.keys(playerUpdates).length > 0) {
+      this.sendDeltaUpdate(playerUpdates);
+    }
+    
+    if (objectUpdates.length > 0) {
+      this.sendObjectUpdate(objectUpdates);
     }
   }
 
-  // ===== ОТПРАВКА СОСТОЯНИЙ =====
-  sendState() {
-    if (this.players.size === 0) return;
+  sendDeltaUpdate(playerChanges) {
+    if (Object.keys(playerChanges).length === 0) return;
     
-    const state = {
-      type: 'state',
-      players: this.serializePlayers(),
-      objects: this.objects,
+    this.broadcastMessage('delta', {
+      players: playerChanges,
+      timestamp: Date.now(),
+      serverTime: Date.now()
+    });
+  }
+
+  sendObjectUpdate(objectChanges) {
+    if (objectChanges.length === 0) return;
+    
+    this.broadcastMessage('delta', {
+      objects: objectChanges,
+      timestamp: Date.now(),
+      serverTime: Date.now()
+    });
+  }
+
+  broadcastState() {
+    const now = Date.now();
+    this.updateState();
+    this.broadcastMessage('state', {
+      players: this.state.players,
+      objects: this.state.objects,
       tps: this.currentTPS,
-      timestamp: Date.now(),
-      serverTime: Date.now()
-    };
-    
-    this.broadcastMessage(state);
+      timestamp: now,
+      serverTime: now
+    });
+    this.lastStateSend = now;
   }
 
-  sendDelta(moves) {
-    const delta = {
-      type: 'delta',
-      moves: moves,
-      timestamp: Date.now(),
-      serverTime: Date.now()
-    };
-    
-    this.broadcastMessage(delta);
+  broadcastMessage(type, data) {
+    this.broadcast(type, data);
   }
 
-  serializePlayers() {
-    const result = {};
-    for (const [id, player] of this.players) {
-      result[id] = {
-        x: Math.round(player.x * 1000) / 1000,
-        z: Math.round(player.z * 1000) / 1000,
-        y: player.y,
-        rotation: player.rotation,
-        pitch: player.pitch,
-        health: player.health,
-        lastUpdate: player.lastUpdate,
-        // Для интерполяции на клиенте
-        prevX: player.prevX,
-        prevZ: player.prevZ,
-        prevR: player.prevR
-      };
+  // ===== Игровой цикл =====
+  gameTick() {
+    const now = Date.now();
+    this.tickCount++;
+    
+    const elapsed = (now - this.lastTickTime) / 1000;
+    if (elapsed >= 0.5) {
+      this.currentTPS = Math.round(this.tickCount / elapsed);
+      this.tickCount = 0;
+      this.lastTickTime = now;
     }
-    return result;
-  }
-
-  // ===== BROADCAST =====
-  broadcastMessage(message) {
-    const data = typeof message === 'string' ? message : JSON.stringify(message);
-    const sockets = this.ctx.getWebSockets();
     
-    for (const ws of sockets) {
-      try {
-        ws.send(data);
-      } catch (error) {
-        // Игнорируем
-      }
+    this.processUpdates();
+    
+    if (now - this.lastStateSend > 1000 / this.config.stateSendRate) {
+      this.broadcastState();
+    }
+    
+    if (this.tickCount % Math.round(this.config.tickRate / this.config.heartbeatRate) === 0) {
+      this.sendHeartbeat();
+    }
+    
+    if (now - this.lastCleanup > this.config.cleanupInterval) {
+      this.cleanupAllPlayers();
+      this.lastCleanup = now;
+    }
+    
+    this.checkConnections();
+    
+    if (this.players.size === 0) {
+      this.stopGameLoop();
     }
   }
 
-  broadcastToOthers(exclude, message) {
-    const data = typeof message === 'string' ? message : JSON.stringify(message);
-    const sockets = this.ctx.getWebSockets();
-    
-    for (const ws of sockets) {
-      if (ws === exclude) continue;
-      try {
-        ws.send(data);
-      } catch (error) {
-        // Игнорируем
-      }
-    }
+  sendHeartbeat() {
+    const now = Date.now();
+    this.broadcastMessage('heartbeat', {
+      timestamp: now,
+      serverTime: now,
+      players: this.players.size
+    });
   }
 
-  // ===== ОЧИСТКА =====
-  cleanupPlayers() {
+  checkConnections() {
     const now = Date.now();
     const timeout = 30000;
-    const toRemove = [];
+    
+    const activePlayers = new Set();
+    
+    for (const client of this.clients) {
+      try {
+        const wsData = this.wsCache.get(client);
+        if (wsData && wsData.playerId) {
+          activePlayers.add(wsData.playerId);
+          
+          if (now - wsData.lastActivity > timeout) {
+            this.wsCache.delete(client);
+            client.leave(1000, 'Connection timeout');
+          }
+        }
+      } catch (error) {
+        console.error('[CheckConnections] Error:', error);
+      }
+    }
     
     for (const [id, player] of this.players) {
-      if (now - player.lastActivity > timeout) {
-        toRemove.push(id);
+      const isActive = activePlayers.has(id);
+      player.wsConnected = isActive;
+      
+      if (isActive) {
+        player.lastUpdate = now;
       }
     }
     
-    for (const id of toRemove) {
-      this.players.delete(id);
-      // Удаляем ws
-      for (const [ws, wsId] of this.wsMap) {
-        if (wsId === id) {
-          this.wsMap.delete(ws);
-          try { ws.close(1000, 'Timeout'); } catch(e) {}
-          break;
+    if (this.players.size > activePlayers.size) {
+      const staleTimeout = 10000;
+      const stalePlayers = [];
+      
+      for (const [id, player] of this.players) {
+        if (!player.wsConnected && (now - player.lastUpdate > staleTimeout)) {
+          stalePlayers.push(id);
         }
       }
-    }
-    
-    if (toRemove.length > 0) {
-      console.log(`[Cleanup] Removed ${toRemove.length} players`);
-      this.saveState();
+      
+      if (stalePlayers.length > 0) {
+        for (const id of stalePlayers) {
+          this.players.delete(id);
+          this.playerCache.delete(id);
+        }
+        this.saveState();
+        this.updateState();
+      }
     }
   }
 
-  // ===== ХЕНДЛЕРЫ =====
-  async handleStats() {
+  async cleanupAllPlayers() {
+    const now = Date.now();
+    const activePlayerIds = new Set();
+    
+    for (const client of this.clients) {
+      try {
+        const wsData = this.wsCache.get(client);
+        if (wsData && wsData.playerId) {
+          activePlayerIds.add(wsData.playerId);
+        }
+      } catch (error) {
+        console.error('[Cleanup] Error getting client data:', error);
+      }
+    }
+    
+    const removed = [];
+    
+    for (const [id, player] of this.players) {
+      const isActive = activePlayerIds.has(id);
+      const isStale = now - player.lastUpdate > 10000;
+      const isInactive = now - player.lastActivity > 30000;
+      
+      if (!isActive || isStale || isInactive) {
+        removed.push(id);
+      }
+    }
+    
+    if (removed.length > 0) {
+      for (const id of removed) {
+        this.players.delete(id);
+        this.playerCache.delete(id);
+      }
+      
+      await this.saveState();
+      this.updateState();
+      console.log(`[Cleanup] Removed ${removed.length} players`);
+      
+      if (removed.length > 0 && this.players.size > 0) {
+        this.broadcastState();
+      }
+    }
+    
+    return removed;
+  }
+
+  // ===== Durable Object методы для совместимости =====
+  async fetch(request) {
+    const url = new URL(request.url);
+    const path = url.pathname;
+    
+    try {
+      if (path === '/reset') {
+        return this.handleReset();
+      }
+      
+      if (path === '/stats') {
+        return this.handleStats();
+      }
+      
+      if (path === '/cleanup') {
+        return this.handleCleanup();
+      }
+      
+      if (path === '/debug') {
+        return this.handleDebug();
+      }
+      
+      return new Response('Not found', { status: 404 });
+    } catch (error) {
+      console.error('[GameRoom] Request error:', error);
+      return new Response('Server error', { status: 500 });
+    }
+  }
+
+  async handleReset() {
+    this.players.clear();
+    await this.saveState();
+    
+    for (const client of this.clients) {
+      try {
+        client.leave(1000, 'Server reset');
+      } catch (e) {}
+    }
+    
+    this.stopGameLoop();
+    this.startGameLoop();
+    this.updateState();
+    
     return new Response(JSON.stringify({
+      success: true,
+      message: 'Server reset complete'
+    }), {
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+
+  async handleStats() {
+    const now = Date.now();
+    
+    const players = Array.from(this.players.values()).map(p => ({
+      id: p.id.slice(0, 8),
+      health: p.health,
+      ping: p.ping,
+      lastUpdate: Math.floor((now - p.lastUpdate) / 1000) + 's ago',
+      isMoving: p.isMoving || false,
+      position: `${p.x.toFixed(1)}, ${p.z.toFixed(1)}`,
+      wsConnected: p.wsConnected
+    }));
+    
+    return new Response(JSON.stringify({
+      tps: this.currentTPS,
       players: this.players.size,
       maxPlayers: this.config.maxPlayers,
       objects: this.objects.length,
-      tps: this.currentTPS,
-      connections: this.ctx.getWebSockets().length,
+      wsConnections: this.clients.size,
+      uptime: Math.floor((now - Date.now()) / 60000) + 'm',
+      playerList: players,
+      memory: {
+        bufferSize: this.updateBuffer.length,
+        cacheSize: this.playerCache.size,
+        wsCacheSize: this.wsCache.size
+      }
+    }), {
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+
+  async handleCleanup() {
+    const removed = await this.cleanupAllPlayers();
+    return new Response(JSON.stringify({
+      removed: removed,
+      remaining: this.players.size,
+      wsConnections: this.clients.size
+    }), {
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+
+  async handleDebug() {
+    return new Response(JSON.stringify({
+      players: Array.from(this.players.keys()),
+      wsConnections: this.clients.size,
+      objects: this.objects.length,
+      tickInterval: !!this.tickInterval,
+      currentTPS: this.currentTPS,
       bufferSize: this.updateBuffer.length
     }), {
       headers: { 'Content-Type': 'application/json' }
     });
   }
 
-  async handleReset() {
-    this.players.clear();
-    this.wsMap.clear();
-    this.updateBuffer = [];
-    
-    for (const ws of this.ctx.getWebSockets()) {
-      try { ws.close(1000, 'Reset'); } catch(e) {}
-    }
-    
+  // ===== Жизненный цикл Durable Object =====
+  async onDispose() {
+    console.log('GameRoom disposing');
+    this.stopGameLoop();
     await this.saveState();
-    
-    return new Response(JSON.stringify({ success: true }), {
-      headers: { 'Content-Type': 'application/json' }
-    });
-  }
-
-  webSocketClose(ws) {
-    const playerId = this.wsMap.get(ws);
-    if (playerId) {
-      this.players.delete(playerId);
-      this.wsMap.delete(ws);
-      console.log(`[WS] Player ${playerId} disconnected`);
-      
-      this.broadcastMessage({
-        type: 'player_left',
-        id: playerId
-      });
-    }
-  }
-
-  webSocketError(ws, error) {
-    console.error('[WS] Error:', error);
-    this.webSocketClose(ws);
   }
 }
 
@@ -564,438 +772,32 @@ export default {
     const url = new URL(request.url);
     
     try {
-      // Корневой путь - HTML
-      if (url.pathname === '/') {
-        return new Response(getHTML(), {
-          headers: { 'Content-Type': 'text/html' }
-        });
-      }
-      
-      // Клиентский JS
-      if (url.pathname === '/client.js') {
-        return new Response(getClientJS(), {
-          headers: { 'Content-Type': 'application/javascript' }
-        });
-      }
-      
-      // WebSocket - передаем в Durable Object
-      if (url.pathname === '/ws') {
+      // Проверяем, не WebSocket ли это соединение
+      if (url.pathname === '/ws' || url.pathname === '/colyseus') {
+        // Создаем экземпляр Durable Object
         const id = env.GAME_ROOM.idFromName('main');
         const room = env.GAME_ROOM.get(id);
+        
+        // Создаем Colyseus сервер внутри Durable Object
+        // Для WebSocket используем Durable Object напрямую
         return room.fetch(request);
       }
       
-      // API
-      if (url.pathname.startsWith('/api/')) {
-        const id = env.GAME_ROOM.idFromName('main');
-        const room = env.GAME_ROOM.get(id);
-        return room.fetch(request);
+      // Обычные HTTP запросы к API
+      if (url.pathname === '/' || url.pathname === '/') {
+        return new Response('Game Server Running (Colyseus)', {
+          status: 200,
+          headers: { 'Content-Type': 'text/plain' }
+        });
       }
       
-      return new Response('Not Found', { status: 404 });
+      const id = env.GAME_ROOM.idFromName('main');
+      const room = env.GAME_ROOM.get(id);
+      return room.fetch(request);
+      
     } catch (error) {
       console.error('[Worker] Error:', error);
-      return new Response('Error', { status: 500 });
+      return new Response('Internal Server Error', { status: 500 });
     }
   }
 };
-
-// ===== HTML =====
-function getHTML() {
-  return `<!DOCTYPE html>
-<html>
-<head>
-  <title>Multiplayer Game</title>
-  <style>
-    * { margin: 0; padding: 0; }
-    body { 
-      background: #0a0a1a; 
-      display: flex; 
-      justify-content: center; 
-      align-items: center; 
-      height: 100vh;
-      font-family: Arial;
-    }
-    #container { position: relative; }
-    canvas {
-      background: #1a1a2e;
-      border: 2px solid #2a2a4e;
-      border-radius: 8px;
-    }
-    #ui {
-      position: absolute;
-      top: 10px;
-      left: 10px;
-      color: #fff;
-      font-size: 12px;
-      background: rgba(0,0,0,0.7);
-      padding: 8px 12px;
-      border-radius: 4px;
-      pointer-events: none;
-    }
-    #controls {
-      position: absolute;
-      bottom: 10px;
-      left: 50%;
-      transform: translateX(-50%);
-      color: #666;
-      font-size: 12px;
-      background: rgba(0,0,0,0.7);
-      padding: 4px 12px;
-      border-radius: 4px;
-      pointer-events: none;
-    }
-  </style>
-</head>
-<body>
-  <div id="container">
-    <canvas id="game" width="800" height="600"></canvas>
-    <div id="ui">Connecting...</div>
-    <div id="controls">WASD - Move | Click - Shoot</div>
-  </div>
-  <script src="/client.js"></script>
-</body>
-</html>`;
-}
-
-// ===== КЛИЕНТСКИЙ JS =====
-function getClientJS() {
-  return `
-// ===== КЛИЕНТ =====
-class GameClient {
-  constructor() {
-    this.players = new Map();
-    this.localId = null;
-    this.localPlayer = null;
-    this.keys = {};
-    this.ws = null;
-    this.canvas = document.getElementById('game');
-    this.ctx = this.canvas.getContext('2d');
-    this.ui = document.getElementById('ui');
-    this.interpolationDelay = 50;
-    
-    this.setupInput();
-    this.connect();
-    this.loop();
-  }
-  
-  connect() {
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    this.ws = new WebSocket(\`\${protocol}//\${window.location.host}/ws\`);
-    
-    this.ws.onopen = () => {
-      this.ui.textContent = 'Connected!';
-      console.log('Connected');
-    };
-    
-    this.ws.onmessage = (e) => {
-      try {
-        const data = JSON.parse(e.data);
-        this.handleMessage(data);
-      } catch(err) {
-        console.error('Parse error:', err);
-      }
-    };
-    
-    this.ws.onclose = () => {
-      this.ui.textContent = 'Disconnected! Reconnecting...';
-      console.log('Disconnected, reconnecting...');
-      setTimeout(() => this.connect(), 3000);
-    };
-    
-    this.ws.onerror = (err) => {
-      console.error('WS error:', err);
-    };
-  }
-  
-  handleMessage(data) {
-    switch(data.type) {
-      case 'init':
-        this.handleInit(data);
-        break;
-      case 'state':
-        this.handleState(data);
-        break;
-      case 'delta':
-        this.handleDelta(data);
-        break;
-      case 'player_joined':
-        this.handlePlayerJoined(data);
-        break;
-      case 'player_left':
-        this.players.delete(data.id);
-        break;
-      case 'shoot_result':
-        if (data.hit) console.log('Hit!');
-        break;
-      case 'pong':
-        this.handlePong(data);
-        break;
-    }
-  }
-  
-  handleInit(data) {
-    this.localId = data.playerId;
-    this.interpolationDelay = data.config?.interpolationDelay || 50;
-    
-    // Создаем игроков
-    for (const [id, p] of Object.entries(data.players)) {
-      this.players.set(id, {
-        ...p,
-        renderX: p.x,
-        renderZ: p.z,
-        renderR: p.rotation,
-        prevX: p.x,
-        prevZ: p.z,
-        prevR: p.rotation,
-        lastUpdate: Date.now()
-      });
-      if (id === this.localId) {
-        this.localPlayer = this.players.get(id);
-      }
-    }
-    
-    this.ui.textContent = \`Players: \${this.players.size}\`;
-    console.log('Init complete');
-  }
-  
-  handleState(data) {
-    const now = Date.now();
-    
-    for (const [id, p] of Object.entries(data.players)) {
-      let player = this.players.get(id);
-      
-      if (!player) {
-        player = {
-          ...p,
-          renderX: p.x,
-          renderZ: p.z,
-          renderR: p.rotation,
-          prevX: p.x,
-          prevZ: p.z,
-          prevR: p.rotation,
-          lastUpdate: now
-        };
-        this.players.set(id, player);
-      } else {
-        // Сохраняем для интерполяции
-        player.prevX = player.x;
-        player.prevZ = player.z;
-        player.prevR = player.rotation;
-        player.lastUpdate = now;
-        
-        // Обновляем
-        player.x = p.x;
-        player.z = p.z;
-        player.rotation = p.rotation;
-        player.pitch = p.pitch;
-        player.health = p.health;
-      }
-      
-      if (id === this.localId) {
-        this.localPlayer = player;
-      }
-    }
-    
-    // Удаляем отсутствующих
-    for (const id of this.players.keys()) {
-      if (!data.players[id]) {
-        this.players.delete(id);
-      }
-    }
-    
-    this.ui.textContent = \`Players: \${this.players.size} | TPS: \${data.tps || 0}\`;
-  }
-  
-  handleDelta(data) {
-    const now = Date.now();
-    
-    for (const [id, move] of Object.entries(data.moves)) {
-      const player = this.players.get(id);
-      if (!player) continue;
-      
-      player.prevX = player.x;
-      player.prevZ = player.z;
-      player.prevR = player.rotation;
-      player.lastUpdate = now;
-      
-      player.x = move.x;
-      player.z = move.z;
-      player.rotation = move.rotation;
-      player.pitch = move.pitch;
-    }
-  }
-  
-  handlePlayerJoined(data) {
-    const player = {
-      x: data.player.x,
-      z: data.player.z,
-      rotation: data.player.rotation,
-      health: data.player.health,
-      renderX: data.player.x,
-      renderZ: data.player.z,
-      renderR: data.player.rotation,
-      prevX: data.player.x,
-      prevZ: data.player.z,
-      prevR: data.player.rotation,
-      lastUpdate: Date.now()
-    };
-    this.players.set(data.id, player);
-  }
-  
-  handlePong(data) {
-    const ping = Date.now() - data.timestamp;
-    this.ui.textContent = \`Ping: \${ping}ms | Players: \${this.players.size}\`;
-  }
-  
-  setupInput() {
-    document.addEventListener('keydown', (e) => {
-      this.keys[e.key.toLowerCase()] = true;
-    });
-    document.addEventListener('keyup', (e) => {
-      this.keys[e.key.toLowerCase()] = false;
-    });
-    this.canvas.addEventListener('click', () => this.shoot());
-  }
-  
-  shoot() {
-    if (this.ws?.readyState === WebSocket.OPEN && this.localPlayer) {
-      this.ws.send(JSON.stringify({
-        type: 'shoot',
-        rotation: this.localPlayer.rotation || 0
-      }));
-    }
-  }
-  
-  loop() {
-    const now = Date.now();
-    this.updateLocal();
-    this.interpolate(now);
-    this.render();
-    requestAnimationFrame(() => this.loop());
-  }
-  
-  updateLocal() {
-    if (!this.localPlayer || !this.ws) return;
-    
-    const speed = 5;
-    let dx = 0, dz = 0;
-    
-    if (this.keys['w']) dz -= speed;
-    if (this.keys['s']) dz += speed;
-    if (this.keys['a']) dx -= speed;
-    if (this.keys['d']) dx += speed;
-    
-    if (dx !== 0 || dz !== 0) {
-      const len = Math.sqrt(dx*dx + dz*dz);
-      if (len > speed) {
-        dx = dx / len * speed;
-        dz = dz / len * speed;
-      }
-      
-      const dt = 0.016;
-      this.localPlayer.x += dx * dt;
-      this.localPlayer.z += dz * dt;
-      
-      this.localPlayer.x = Math.max(-30, Math.min(30, this.localPlayer.x));
-      this.localPlayer.z = Math.max(-30, Math.min(30, this.localPlayer.z));
-      
-      // Отправка движения
-      if (this.ws.readyState === WebSocket.OPEN) {
-        this.ws.send(JSON.stringify({
-          type: 'move',
-          x: this.localPlayer.x,
-          z: this.localPlayer.z,
-          rotation: this.localPlayer.rotation || 0,
-          pitch: this.localPlayer.pitch || 0
-        }));
-      }
-    }
-  }
-  
-  interpolate(now) {
-    const renderTime = now - this.interpolationDelay;
-    
-    for (const [id, player] of this.players) {
-      if (!player.prevX) continue;
-      
-      const timeDiff = renderTime - player.lastUpdate;
-      const factor = Math.max(0, Math.min(1, timeDiff / 50));
-      
-      // Плавная интерполяция
-      player.renderX = player.prevX + (player.x - player.prevX) * factor;
-      player.renderZ = player.prevZ + (player.z - player.prevZ) * factor;
-      player.renderR = player.prevR + (player.rotation - player.prevR) * factor;
-    }
-  }
-  
-  render() {
-    const ctx = this.ctx;
-    const c = this.canvas;
-    const local = this.localPlayer;
-    
-    ctx.clearRect(0, 0, c.width, c.height);
-    
-    // Сетка
-    ctx.strokeStyle = '#2a2a4e';
-    ctx.lineWidth = 0.5;
-    for (let i = -30; i <= 30; i += 5) {
-      const x = c.width/2 + (i - (local?.x || 0)) * 20;
-      ctx.beginPath();
-      ctx.moveTo(x, 0);
-      ctx.lineTo(x, c.height);
-      ctx.stroke();
-      
-      const y = c.height/2 + (i - (local?.z || 0)) * 20;
-      ctx.beginPath();
-      ctx.moveTo(0, y);
-      ctx.lineTo(c.width, y);
-      ctx.stroke();
-    }
-    
-    // Игроки
-    for (const [id, player] of this.players) {
-      const x = c.width/2 + (player.renderX - (local?.x || 0)) * 20;
-      const y = c.height/2 + (player.renderZ - (local?.z || 0)) * 20;
-      
-      // Тело
-      ctx.beginPath();
-      ctx.arc(x, y, 10, 0, Math.PI * 2);
-      
-      if (id === this.localId) {
-        ctx.fillStyle = '#00ff88';
-        ctx.strokeStyle = '#00ffcc';
-      } else {
-        ctx.fillStyle = '#ff4444';
-        ctx.strokeStyle = '#ff6666';
-      }
-      ctx.fill();
-      ctx.stroke();
-      
-      // Направление
-      ctx.beginPath();
-      ctx.moveTo(x, y);
-      ctx.lineTo(
-        x + Math.sin(player.renderR || 0) * 25,
-        y + Math.cos(player.renderR || 0) * 25
-      );
-      ctx.strokeStyle = '#fff';
-      ctx.lineWidth = 2;
-      ctx.stroke();
-      
-      // Имя
-      ctx.fillStyle = '#fff';
-      ctx.font = '10px Arial';
-      ctx.textAlign = 'center';
-      ctx.fillText(id.slice(0, 6), x, y - 20);
-      
-      // HP
-      ctx.fillStyle = player.health > 50 ? '#0f0' : '#f00';
-      ctx.fillRect(x - 15, y - 30, 30 * (player.health / 100), 3);
-    }
-  }
-}
-
-// Запуск
-new GameClient();`;
-      }
