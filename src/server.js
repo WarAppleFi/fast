@@ -13,7 +13,6 @@ export class GameRoom extends DurableObject {
     this.lastUpdate = Date.now();
     this.updateCounter = 0;
     
-    // Инициализация при создании
     this.ctx.blockConcurrencyWhile(async () => {
       await this.initialize();
     });
@@ -69,8 +68,11 @@ export class GameRoom extends DurableObject {
   }
 
   async addPlayer(playerId) {
+    // Если игрок уже есть - просто обновляем время
     if (this.players.has(playerId)) {
-      return this.players.get(playerId);
+      const player = this.players.get(playerId);
+      player.lastActive = Date.now();
+      return player;
     }
 
     const player = {
@@ -129,7 +131,7 @@ export class GameRoom extends DurableObject {
 
   async cleanupInactive() {
     const now = Date.now();
-    const timeout = 30000;
+    const timeout = 30000; // 30 секунд
     let removed = 0;
 
     for (const [id, player] of this.players) {
@@ -155,7 +157,7 @@ export class GameRoom extends DurableObject {
 // ============================================
 export default {
   async fetch(request, env) {
-    // ===== CORS PREFLIGHT =====
+    // CORS PREFLIGHT
     if (request.method === 'OPTIONS') {
       return new Response(null, {
         headers: {
@@ -172,7 +174,6 @@ export default {
     const gameId = url.searchParams.get('id') || 'main';
     
     try {
-      // Получаем Durable Object
       const id = env.GAME.idFromName(gameId);
       const gameRoom = env.GAME.get(id);
 
@@ -189,7 +190,14 @@ export default {
 
       // ============ JOIN ============
       if (path === '/join') {
-        const playerId = url.searchParams.get('playerId') || crypto.randomUUID().slice(0, 8);
+        // Берем ID из параметров или создаем новый
+        let playerId = url.searchParams.get('playerId');
+        
+        // Если ID не передан или это "null" - создаем новый
+        if (!playerId || playerId === 'null' || playerId === 'undefined') {
+          playerId = crypto.randomUUID().slice(0, 8);
+        }
+        
         const player = await gameRoom.addPlayer(playerId);
         const state = await gameRoom.getState();
         
