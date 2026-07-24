@@ -16,13 +16,6 @@ export class GameRoom {
     this.lastCleanupTime = Date.now();
     this.isInitialized = false;
     
-    // Храним предыдущие состояния для дельта-обновлений
-    this.previousState = {
-      players: {},
-      objects: []
-    };
-    
-    // Очередь изменений
     this.pendingDeltas = [];
     this.lastFullStateTime = 0;
     
@@ -127,7 +120,6 @@ export class GameRoom {
       };
       
       this.players[playerId] = player;
-      this.previousState.players[playerId] = { ...player };
       
       await this.storage.put('state', {
         players: this.players,
@@ -150,6 +142,25 @@ export class GameRoom {
         tps: 30,
         serverTime: Date.now()
       }));
+      
+      // Отправляем обновление всем остальным игрокам
+      const updateMessage = JSON.stringify({
+        type: 'state',
+        players: this.players,
+        objects: this.objects,
+        tps: this.currentTPS || 30,
+        timestamp: Date.now(),
+        serverTime: Date.now()
+      });
+      
+      this.ctx.getWebSockets().forEach(wsClient => {
+        try {
+          const attachment = wsClient.deserializeAttachment();
+          if (attachment?.playerId && attachment.playerId !== playerId) {
+            wsClient.send(updateMessage);
+          }
+        } catch(e) {}
+      });
       
       if (!this.tickInterval) {
         this.tickInterval = setInterval(() => this.gameTick(), 33);
@@ -222,7 +233,6 @@ export class GameRoom {
       if (!hasWs || isStale) {
         removed.push(id);
         delete this.players[id];
-        delete this.previousState.players[id];
       }
     }
     
@@ -238,7 +248,6 @@ export class GameRoom {
     return removed;
   }
 
-  // Метод для отправки дельта-обновлений
   sendDeltaUpdate(changes) {
     if (Object.keys(changes).length === 0) return;
     
@@ -259,7 +268,6 @@ export class GameRoom {
     });
   }
 
-  // Отправка полного состояния (периодическая)
   sendFullState() {
     const now = Date.now();
     const state = {
@@ -316,7 +324,6 @@ export class GameRoom {
         return;
       }
       
-      // Переменная для хранения изменений игрока
       let playerChanges = null;
       
       switch(data.type) {
@@ -330,10 +337,13 @@ export class GameRoom {
           const oldPitch = player.pitch;
           
           let hasChanged = false;
+          let changes = {};
           
           if (data.x !== undefined && data.z !== undefined) {
             player.x = Math.max(-30, Math.min(30, data.x));
             player.z = Math.max(-30, Math.min(30, data.z));
+            changes.x = player.x;
+            changes.z = player.z;
             
             const dx = player.x - oldX;
             const dz = player.z - oldZ;
@@ -350,26 +360,22 @@ export class GameRoom {
             hasChanged = true;
           }
           
+          // ВСЕГДА обновляем rotation и pitch, если они пришли
           if (data.rotation !== undefined) {
             player.rotation = data.rotation;
+            changes.rotation = player.rotation;
             hasChanged = true;
           }
           
           if (data.pitch !== undefined) {
             player.pitch = Math.max(-Math.PI/2, Math.min(Math.PI/2, data.pitch));
+            changes.pitch = player.pitch;
             hasChanged = true;
           }
           
-          // Если есть изменения - отправляем дельту
           if (hasChanged) {
             playerChanges = {
-              [playerId]: {
-                x: player.x,
-                z: player.z,
-                rotation: player.rotation,
-                pitch: player.pitch,
-                isMoving: player.isMoving
-              }
+              [playerId]: changes
             };
             
             this.sendDeltaUpdate(playerChanges);
@@ -385,6 +391,7 @@ export class GameRoom {
           
           let hit = false;
           let objectsChanged = false;
+          let objectUpdates = [];
           
           this.objects = this.objects.map(obj => {
             const dx = obj.x - rayX;
@@ -392,33 +399,29 @@ export class GameRoom {
             if (Math.abs(dx) < 2 && Math.abs(dz) < 2 && obj.h > 0) {
               hit = true;
               objectsChanged = true;
-              return { ...obj, h: Math.max(0, obj.h - 0.5) };
+              const newH = Math.max(0, obj.h - 0.5);
+              objectUpdates.push({
+                id: obj.id,
+                h: newH,
+                x: obj.x,
+                z: obj.z,
+                y: obj.y
+              });
+              return { ...obj, h: newH };
             }
             return obj;
           });
           
           this.objects = this.objects.filter(obj => obj.h > 0);
           
-          // Если объекты изменились - отправляем полное состояние (или дельту объектов)
           if (objectsChanged) {
-            // Отправляем дельту с объектами
-            const objectChanges = {
-              objects: this.objects.map(obj => ({
-                id: obj.id,
-                h: obj.h,
-                x: obj.x,
-                z: obj.z,
-                y: obj.y
-              }))
-            };
-            
             this.ctx.getWebSockets().forEach(wsClient => {
               try {
                 const attachment = wsClient.deserializeAttachment();
                 if (attachment?.playerId) {
                   wsClient.send(JSON.stringify({
                     type: 'delta',
-                    objects: objectChanges.objects,
+                    objects: objectUpdates,
                     timestamp: now,
                     serverTime: now
                   }));
@@ -447,7 +450,6 @@ export class GameRoom {
           break;
       }
       
-      // Сохраняем состояние после каждого обновления
       await this.storage.put('state', {
         players: this.players,
         objects: this.objects
@@ -469,17 +471,14 @@ export class GameRoom {
       this.lastTickTime = now;
     }
     
-    // Очистка каждые 30 тиков
     if (this.tickCount % 30 === 0) {
       this.cleanupAllPlayers();
     }
     
-    // Отправляем полное состояние каждую секунду для синхронизации
     if (now - this.lastFullStateTime > 1000) {
       this.sendFullState();
     }
     
-    // Отправляем heartbeat для проверки соединения
     if (this.tickCount % 10 === 0) {
       const heartbeat = {
         type: 'heartbeat',
@@ -498,7 +497,6 @@ export class GameRoom {
       });
     }
     
-    // Обновляем флаги подключения
     const activePlayerIds = new Set();
     this.ctx.getWebSockets().forEach(ws => {
       try {
