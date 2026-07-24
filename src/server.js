@@ -12,6 +12,11 @@ export class GameRoom extends DurableObject {
     this.worldHeight = 600;
     this.lastUpdate = Date.now();
     this.updateCounter = 0;
+    
+    // Инициализация при создании
+    this.ctx.blockConcurrencyWhile(async () => {
+      await this.initialize();
+    });
   }
 
   async initialize() {
@@ -44,8 +49,6 @@ export class GameRoom extends DurableObject {
   // ============ HTTP METHODS ============
   
   async getState() {
-    await this.initialize();
-    
     const state = {
       type: 'state',
       timestamp: Date.now(),
@@ -66,8 +69,6 @@ export class GameRoom extends DurableObject {
   }
 
   async addPlayer(playerId) {
-    await this.initialize();
-    
     if (this.players.has(playerId)) {
       return this.players.get(playerId);
     }
@@ -90,12 +91,9 @@ export class GameRoom extends DurableObject {
   }
 
   async updatePlayer(playerId, data) {
-    await this.initialize();
-    
     const player = this.players.get(playerId);
     if (!player) return null;
 
-    // Обновляем позицию
     if (data.x !== undefined) {
       player.x = Math.max(20, Math.min(this.worldWidth - 20, data.x));
     }
@@ -112,7 +110,6 @@ export class GameRoom extends DurableObject {
     player.lastActive = Date.now();
     this.updateCounter++;
 
-    // Сохраняем каждые 10 обновлений
     if (this.updateCounter % 10 === 0) {
       await this.saveState();
     }
@@ -121,8 +118,6 @@ export class GameRoom extends DurableObject {
   }
 
   async removePlayer(playerId) {
-    await this.initialize();
-    
     if (this.players.has(playerId)) {
       this.players.delete(playerId);
       await this.saveState();
@@ -133,10 +128,8 @@ export class GameRoom extends DurableObject {
   }
 
   async cleanupInactive() {
-    await this.initialize();
-    
     const now = Date.now();
-    const timeout = 30000; // 30 секунд неактивности
+    const timeout = 30000;
     let removed = 0;
 
     for (const [id, player] of this.players) {
@@ -153,7 +146,6 @@ export class GameRoom extends DurableObject {
   }
 
   async getPlayerCount() {
-    await this.initialize();
     return this.players.size;
   }
 }
@@ -163,17 +155,29 @@ export class GameRoom extends DurableObject {
 // ============================================
 export default {
   async fetch(request, env) {
+    // ===== CORS PREFLIGHT =====
+    if (request.method === 'OPTIONS') {
+      return new Response(null, {
+        headers: {
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+          'Access-Control-Allow-Headers': 'Content-Type',
+          'Access-Control-Max-Age': '86400',
+        }
+      });
+    }
+
     const url = new URL(request.url);
     const path = url.pathname;
     const gameId = url.searchParams.get('id') || 'main';
     
-    // Получаем Durable Object
-    const id = env.GAME.idFromName(gameId);
-    const gameRoom = env.GAME.get(id);
+    try {
+      // Получаем Durable Object
+      const id = env.GAME.idFromName(gameId);
+      const gameRoom = env.GAME.get(id);
 
-    // ============ GET STATE ============
-    if (path === '/state') {
-      try {
+      // ============ GET STATE ============
+      if (path === '/state') {
         const state = await gameRoom.getState();
         return new Response(JSON.stringify(state), {
           headers: { 
@@ -181,21 +185,12 @@ export default {
             'Access-Control-Allow-Origin': '*'
           }
         });
-      } catch (e) {
-        console.error('[Worker] State error:', e);
-        return new Response(JSON.stringify({ error: 'Failed to get state' }), {
-          status: 500,
-          headers: { 'Content-Type': 'application/json' }
-        });
       }
-    }
 
-    // ============ JOIN ============
-    if (path === '/join') {
-      try {
+      // ============ JOIN ============
+      if (path === '/join') {
         const playerId = url.searchParams.get('playerId') || crypto.randomUUID().slice(0, 8);
         const player = await gameRoom.addPlayer(playerId);
-        
         const state = await gameRoom.getState();
         
         return new Response(JSON.stringify({
@@ -209,23 +204,18 @@ export default {
             'Access-Control-Allow-Origin': '*'
           }
         });
-      } catch (e) {
-        console.error('[Worker] Join error:', e);
-        return new Response(JSON.stringify({ error: 'Failed to join' }), {
-          status: 500,
-          headers: { 'Content-Type': 'application/json' }
-        });
       }
-    }
 
-    // ============ MOVE ============
-    if (path === '/move') {
-      try {
+      // ============ MOVE ============
+      if (path === '/move') {
         const playerId = url.searchParams.get('playerId');
         if (!playerId) {
           return new Response(JSON.stringify({ error: 'Missing playerId' }), {
             status: 400,
-            headers: { 'Content-Type': 'application/json' }
+            headers: { 
+              'Content-Type': 'application/json',
+              'Access-Control-Allow-Origin': '*'
+            }
           });
         }
 
@@ -235,7 +225,10 @@ export default {
         if (!player) {
           return new Response(JSON.stringify({ error: 'Player not found' }), {
             status: 404,
-            headers: { 'Content-Type': 'application/json' }
+            headers: { 
+              'Content-Type': 'application/json',
+              'Access-Control-Allow-Origin': '*'
+            }
           });
         }
 
@@ -248,18 +241,10 @@ export default {
             'Access-Control-Allow-Origin': '*'
           }
         });
-      } catch (e) {
-        console.error('[Worker] Move error:', e);
-        return new Response(JSON.stringify({ error: 'Failed to move' }), {
-          status: 500,
-          headers: { 'Content-Type': 'application/json' }
-        });
       }
-    }
 
-    // ============ LEAVE ============
-    if (path === '/leave') {
-      try {
+      // ============ LEAVE ============
+      if (path === '/leave') {
         const playerId = url.searchParams.get('playerId');
         if (playerId) {
           await gameRoom.removePlayer(playerId);
@@ -270,18 +255,10 @@ export default {
             'Access-Control-Allow-Origin': '*'
           }
         });
-      } catch (e) {
-        console.error('[Worker] Leave error:', e);
-        return new Response(JSON.stringify({ error: 'Failed to leave' }), {
-          status: 500,
-          headers: { 'Content-Type': 'application/json' }
-        });
       }
-    }
 
-    // ============ CLEANUP ============
-    if (path === '/cleanup') {
-      try {
+      // ============ CLEANUP ============
+      if (path === '/cleanup') {
         await gameRoom.cleanupInactive();
         return new Response(JSON.stringify({ success: true }), {
           headers: { 
@@ -289,31 +266,41 @@ export default {
             'Access-Control-Allow-Origin': '*'
           }
         });
-      } catch (e) {
-        console.error('[Worker] Cleanup error:', e);
-        return new Response(JSON.stringify({ error: 'Failed to cleanup' }), {
-          status: 500,
-          headers: { 'Content-Type': 'application/json' }
+      }
+
+      // ============ HEALTH ============
+      if (path === '/health' || path === '/') {
+        const count = await gameRoom.getPlayerCount();
+        return new Response(JSON.stringify({
+          status: 'OK',
+          players: count,
+          timestamp: Date.now()
+        }), {
+          headers: { 
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*'
+          }
         });
       }
-    }
 
-    // ============ HEALTH ============
-    if (path === '/health' || path === '/') {
-      const count = await gameRoom.getPlayerCount();
-      return new Response(JSON.stringify({
-        status: 'OK',
-        players: count,
-        timestamp: Date.now()
+      // ============ 404 ============
+      return new Response('Not found', { 
+        status: 404,
+        headers: { 'Access-Control-Allow-Origin': '*' }
+      });
+
+    } catch (e) {
+      console.error('[Worker] Error:', e);
+      return new Response(JSON.stringify({ 
+        error: 'Internal server error',
+        message: e.message 
       }), {
+        status: 500,
         headers: { 
           'Content-Type': 'application/json',
           'Access-Control-Allow-Origin': '*'
         }
       });
     }
-
-    // ============ 404 ============
-    return new Response('Not found', { status: 404 });
   }
 };
