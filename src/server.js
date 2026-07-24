@@ -21,7 +21,7 @@ export class GameRoom {
     const saved = await this.storage.get('state');
     if (saved) {
       this.players = saved.players || {};
-      this.objects = saved.objects || {};
+      this.objects = saved.objects || [];
     } else {
       for (let i = 0; i < 20; i++) {
         this.objects.push({
@@ -52,15 +52,21 @@ export class GameRoom {
       this.ctx.acceptWebSocket(server);
       
       const playerId = crypto.randomUUID();
+      const startX = (Math.random() - 0.5) * 20;
+      const startZ = (Math.random() - 0.5) * 20;
+      
       this.players[playerId] = {
         id: playerId,
-        x: (Math.random() - 0.5) * 20,
-        z: (Math.random() - 0.5) * 20,
+        x: startX,
+        z: startZ,
         y: 0.5,
         rotation: 0,
+        pitch: 0, // Добавляем pitch для вертикального вращения
         health: 100,
         ping: 0,
-        lastMoveTime: Date.now()
+        lastMoveTime: Date.now(),
+        connectedAt: Date.now(),
+        lastUpdate: Date.now()
       };
       
       await this.storage.put('state', {
@@ -68,7 +74,11 @@ export class GameRoom {
         objects: this.objects
       });
       
-      server.serializeAttachment({ playerId, lastPingTime: Date.now() });
+      server.serializeAttachment({ 
+        playerId, 
+        lastPingTime: Date.now(),
+        connectionTime: Date.now()
+      });
       
       server.send(JSON.stringify({
         type: 'init',
@@ -92,7 +102,12 @@ export class GameRoom {
       return new Response(JSON.stringify({
         tps: this.currentTPS,
         players: Object.keys(this.players).length,
-        objects: this.objects.length
+        objects: this.objects.length,
+        playerList: Object.keys(this.players).map(id => ({
+          id: id.slice(0, 8),
+          health: this.players[id].health,
+          ping: this.players[id].ping
+        }))
       }), {
         headers: { 'Content-Type': 'application/json' }
       });
@@ -102,85 +117,109 @@ export class GameRoom {
   }
 
   async webSocketMessage(ws, message) {
-    const data = JSON.parse(message);
-    const attachment = ws.deserializeAttachment();
-    const playerId = attachment?.playerId;
-    
-    if (!playerId || !this.players[playerId]) return;
-    
-    const player = this.players[playerId];
-    
-    if (data.type === 'ping') {
+    try {
+      const data = JSON.parse(message);
+      const attachment = ws.deserializeAttachment();
+      const playerId = attachment?.playerId;
+      
+      if (!playerId || !this.players[playerId]) {
+        // Если игрок не найден, закрываем соединение
+        ws.close(1000, 'Player not found');
+        return;
+      }
+      
+      const player = this.players[playerId];
       const now = Date.now();
-      const ping = now - (attachment.lastPingTime || now);
-      player.ping = ping;
       
-      ws.send(JSON.stringify({
-        type: 'pong',
-        ping: ping,
-        timestamp: now,
-        serverTime: now
-      }));
+      // Обновляем время последнего обновления
+      player.lastUpdate = now;
       
-      return;
-    }
-    
-    switch(data.type) {
-      case 'move':
-        const now = Date.now();
-        const deltaTime = Math.min((now - (player.lastMoveTime || now)) / 1000, 0.05);
-        player.lastMoveTime = now;
+      if (data.type === 'ping') {
+        const ping = now - (attachment.lastPingTime || now);
+        player.ping = Math.min(ping, 1000);
         
-        // Просто сохраняем позицию от клиента
-        if (data.x !== undefined && data.z !== undefined) {
-          // Ограничиваем границы
-          const newX = Math.max(-30, Math.min(30, data.x));
-          const newZ = Math.max(-30, Math.min(30, data.z));
+        ws.send(JSON.stringify({
+          type: 'pong',
+          ping: player.ping,
+          timestamp: now,
+          serverTime: now
+        }));
+        
+        return;
+      }
+      
+      switch(data.type) {
+        case 'move':
+          const deltaTime = Math.min((now - (player.lastMoveTime || now)) / 1000, 0.05);
+          player.lastMoveTime = now;
           
-          // Плавно обновляем позицию на сервере
-          player.x += (newX - player.x) * 0.5;
-          player.z += (newZ - player.z) * 0.5;
-          player.rotation = data.rotation || 0;
-        }
-        break;
-        
-      case 'shoot':
-        const rayX = player.x + Math.sin(player.rotation) * 3;
-        const rayZ = player.z + Math.cos(player.rotation) * 3;
-        
-        this.objects = this.objects.map(obj => {
-          const dx = obj.x - rayX;
-          const dz = obj.z - rayZ;
-          if (Math.abs(dx) < 2 && Math.abs(dz) < 2 && obj.h > 0) {
-            return { ...obj, h: obj.h - 0.5 };
+          if (data.x !== undefined && data.z !== undefined) {
+            // Ограничиваем границы
+            player.x = Math.max(-30, Math.min(30, data.x));
+            player.z = Math.max(-30, Math.min(30, data.z));
           }
-          return obj;
-        });
-        break;
-        
-      case 'chat':
-        const name = playerId.slice(0, 6);
-        const chatMessage = {
-          type: 'chat',
-          id: playerId,
-          name: name,
-          text: data.text,
-          timestamp: Date.now()
-        };
-        
-        const msgStr = JSON.stringify(chatMessage);
-        this.ctx.getWebSockets().forEach(wsClient => {
-          try {
-            wsClient.send(msgStr);
-          } catch(e) {}
-        });
-        break;
+          
+          if (data.rotation !== undefined) {
+            player.rotation = data.rotation;
+          }
+          
+          if (data.pitch !== undefined) {
+            // Ограничиваем pitch от -π/2 до π/2
+            player.pitch = Math.max(-Math.PI/2, Math.min(Math.PI/2, data.pitch));
+          }
+          break;
+          
+        case 'shoot':
+          // Простая проверка на спам
+          if (now - (player.lastShootTime || 0) < 100) break;
+          player.lastShootTime = now;
+          
+          const rayX = player.x + Math.sin(player.rotation) * 3;
+          const rayZ = player.z + Math.cos(player.rotation) * 3;
+          
+          let hit = false;
+          this.objects = this.objects.map(obj => {
+            const dx = obj.x - rayX;
+            const dz = obj.z - rayZ;
+            if (Math.abs(dx) < 2 && Math.abs(dz) < 2 && obj.h > 0) {
+              hit = true;
+              return { ...obj, h: Math.max(0, obj.h - 0.5) };
+            }
+            return obj;
+          });
+          
+          // Удаляем уничтоженные объекты
+          this.objects = this.objects.filter(obj => obj.h > 0);
+          break;
+          
+        case 'chat':
+          const name = playerId.slice(0, 6);
+          const chatMessage = {
+            type: 'chat',
+            id: playerId,
+            name: name,
+            text: data.text.substring(0, 100), // Ограничиваем длину
+            timestamp: now
+          };
+          
+          const msgStr = JSON.stringify(chatMessage);
+          this.ctx.getWebSockets().forEach(wsClient => {
+            try {
+              wsClient.send(msgStr);
+            } catch(e) {}
+          });
+          break;
+      }
+      
+      // Сохраняем состояние
+      await this.storage.put('state', {
+        players: this.players,
+        objects: this.objects
+      });
+      
+    } catch (error) {
+      console.error('WebSocket message error:', error);
     }
-    
-    await this.storage.put('state', {
-      players: this.players,
-      objects: this.objects
-    });
   }
 
   gameTick() {
@@ -194,6 +233,29 @@ export class GameRoom {
       this.lastTickTime = now;
     }
     
+    // Проверка на неактивных игроков (таймаут 10 секунд без обновления)
+    const timeout = 10000;
+    const deadPlayers = [];
+    for (const [id, player] of Object.entries(this.players)) {
+      if (now - player.lastUpdate > timeout) {
+        deadPlayers.push(id);
+      }
+    }
+    
+    // Удаляем неактивных игроков
+    for (const id of deadPlayers) {
+      delete this.players[id];
+      console.log(`Player ${id} removed due to timeout`);
+    }
+    
+    if (deadPlayers.length > 0) {
+      this.storage.put('state', {
+        players: this.players,
+        objects: this.objects
+      });
+    }
+    
+    // Отправляем состояние всем игрокам
     const state = {
       type: 'state',
       players: this.players,
@@ -209,14 +271,29 @@ export class GameRoom {
     sockets.forEach((ws) => {
       try {
         ws.send(message);
-      } catch(e) {}
+      } catch(e) {
+        // Если не удалось отправить, удаляем игрока
+        const attachment = ws.deserializeAttachment();
+        if (attachment?.playerId) {
+          delete this.players[attachment.playerId];
+        }
+      }
     });
+    
+    // Если игроков нет, останавливаем tick
+    if (Object.keys(this.players).length === 0) {
+      clearInterval(this.tickInterval);
+      this.tickInterval = null;
+      this.tickCount = 0;
+      this.currentTPS = 0;
+    }
   }
 
   webSocketClose(ws) {
     const attachment = ws.deserializeAttachment();
     if (attachment?.playerId) {
       delete this.players[attachment.playerId];
+      console.log(`Player ${attachment.playerId} disconnected`);
       
       this.storage.put('state', {
         players: this.players,
@@ -230,6 +307,11 @@ export class GameRoom {
       this.tickCount = 0;
       this.currentTPS = 0;
     }
+  }
+  
+  webSocketError(ws, error) {
+    console.error('WebSocket error:', error);
+    this.webSocketClose(ws);
   }
 }
 
