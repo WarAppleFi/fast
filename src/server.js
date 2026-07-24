@@ -10,6 +10,7 @@ export class GameRoom {
     this.worldWidth = 800;
     this.worldHeight = 600;
     this.speed = 5;
+    this.lastState = null;
   }
 
   async fetch(request) {
@@ -29,11 +30,13 @@ export class GameRoom {
       y: Math.random() * 500 + 50,
       health: 100,
       angle: 0,
-      size: 30 // размер куба
+      size: 30
     };
 
     this.clients.set(id, { ws: server });
     this.players.set(id, player);
+
+    console.log(`🟢 Player joined: ${id}, total: ${this.players.size}`);
 
     server.addEventListener('message', (ev) => {
       try {
@@ -45,17 +48,29 @@ export class GameRoom {
           p.x = Math.max(20, Math.min(this.worldWidth - 20, msg.x));
           p.y = Math.max(20, Math.min(this.worldHeight - 20, msg.y));
           p.angle = msg.angle || 0;
+        } else if (msg.type === 'ping') {
+          // Ответ на пинг
+          server.send(JSON.stringify({ type: 'pong' }));
         }
-      } catch (e) {}
+      } catch (e) {
+        console.error('Message error:', e);
+      }
     });
 
     server.addEventListener('close', () => {
       this.clients.delete(id);
       this.players.delete(id);
+      console.log(`🔴 Player left: ${id}, total: ${this.players.size}`);
+      
       if (this.clients.size === 0 && this.heartbeat) {
         clearInterval(this.heartbeat);
         this.heartbeat = null;
+        console.log('⏹️ Game loop stopped');
       }
+    });
+
+    server.addEventListener('error', (err) => {
+      console.error('WebSocket error:', err);
     });
 
     // Отправляем начальное состояние
@@ -80,12 +95,19 @@ export class GameRoom {
       this.heartbeat = setInterval(() => {
         this.gameLoop();
       }, this.tickInterval);
+      console.log('▶️ Game loop started');
     }
 
     return new Response(null, { status: 101, webSocket: client });
   }
 
   gameLoop() {
+    this.tickCounter++;
+    
+    // Простая логика игры - обновляем здоровье (для примера)
+    // Можно добавить здесь какую-то логику
+    
+    // Формируем состояние
     const state = {
       type: 'state',
       players: {}
@@ -101,13 +123,25 @@ export class GameRoom {
       };
     }
 
+    // Сохраняем последнее состояние для сравнения
     const message = JSON.stringify(state);
+    
+    // Отправляем всем клиентам
+    let sentCount = 0;
     for (const [pid, client] of this.clients) {
       if (client.ws.readyState === 1) {
         try {
           client.ws.send(message);
-        } catch (e) {}
+          sentCount++;
+        } catch (e) {
+          console.error('Send error:', e);
+        }
       }
+    }
+    
+    // Логируем каждые 100 тиков
+    if (this.tickCounter % 100 === 0) {
+      console.log(`📊 Tick ${this.tickCounter}: ${this.players.size} players, ${sentCount} clients`);
     }
   }
 }
@@ -116,8 +150,14 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     const roomId = url.searchParams.get('room') || 'global';
-    const id = env.GAME.idFromName(roomId);
-    const obj = env.GAME.get(id);
-    return obj.fetch(request);
+    
+    try {
+      const id = env.GAME.idFromName(roomId);
+      const obj = env.GAME.get(id);
+      return obj.fetch(request);
+    } catch (e) {
+      console.error('Fetch error:', e);
+      return new Response('Error', { status: 500 });
+    }
   }
 };
