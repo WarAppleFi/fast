@@ -211,7 +211,7 @@ export class GameRoom {
     const message = JSON.stringify(data);
     for (const [ws] of this.sessions) {
       try {
-        if (ws.readyState === WebSocket.OPEN) {
+        if (ws.readyState === 1) { // WebSocket.OPEN
           ws.send(message);
         }
       } catch (e) {
@@ -230,7 +230,7 @@ export class GameRoom {
     
     for (const [ws] of this.sessions) {
       try {
-        if (ws.readyState === WebSocket.OPEN) {
+        if (ws.readyState === 1) { // WebSocket.OPEN
           ws.send(message);
         }
       } catch (e) {
@@ -328,7 +328,6 @@ export default {
         return new Response(null, {
           status: 101,
           webSocket: client,
-          headers: corsHeaders,
         });
       } catch (e) {
         console.error('WebSocket upgrade error:', e);
