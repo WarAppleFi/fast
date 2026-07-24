@@ -1,4 +1,5 @@
-// ===== DURABLE OBJECT - ИСПРАВЛЕННАЯ ВЕРСИЯ =====
+// server.js - Полностью оптимизированный для вашего клиента
+
 export class GameRoom {
   constructor(ctx, env) {
     this.ctx = ctx;
@@ -6,18 +7,17 @@ export class GameRoom {
     this.storage = ctx.storage;
     this.id = ctx.id.toString();
     
-    // ОПТИМИЗИРОВАННЫЕ настройки
+    // НАСТРОЙКИ ПОД КЛИЕНТ
     this.config = {
-      tickRate: 30,              // ↓ 30 вместо 60
-      stateSendRate: 5,          // ↓ 5 полных состояний в секунду
-      heartbeatRate: 5,
-      cleanupInterval: 5000,
+      tickRate: 30,              // 30 TPS
+      stateSendRate: 5,          // 5 полных состояний в секунду
+      snapshotInterval: 200,     // Снапшоты каждые 200ms
       maxPlayers: 50,
       maxObjects: 100,
-      moveThreshold: 0.05,       // ↑ 0.05 вместо 0.001
-      interpolationDelay: 50,    // ↓ 50ms
-      maxSpeed: 10,              // Максимальная скорость
-      snapshotInterval: 200      // Снапшоты каждые 200ms
+      moveThreshold: 0.01,       // Минимальное изменение
+      maxSpeed: 12,              // Максимальная скорость
+      cleanupInterval: 5000,
+      heartbeatRate: 5
     };
     
     // Состояние
@@ -31,9 +31,9 @@ export class GameRoom {
     this.lastSnapshot = 0;
     this.lastCleanup = 0;
     
-    // РАЗДЕЛЬНЫЕ буферы
-    this.moveBuffer = [];      // Высокий приоритет
-    this.stateBuffer = [];     // Низкий приоритет
+    // Буферы
+    this.moveBuffer = [];
+    this.stateBuffer = [];
     
     // Кэши
     this.playerCache = new Map();
@@ -42,6 +42,7 @@ export class GameRoom {
     this.initialize();
   }
 
+  // ===== ИНИЦИАЛИЗАЦИЯ =====
   async initialize() {
     if (this.isInitialized) return;
     this.isInitialized = true;
@@ -55,10 +56,9 @@ export class GameRoom {
             this.players.set(id, data);
           }
         }
+        console.log(`[GameRoom] Loaded ${this.objects.length} objects, ${this.players.size} players`);
       } else {
-        if (this.objects.length === 0) {
-          this.generateObjects();
-        }
+        this.generateObjects();
         await this.saveState();
       }
     } catch (error) {
@@ -112,15 +112,15 @@ export class GameRoom {
     }
   }
 
-  // ===== СЖАТИЕ ДАННЫХ =====
+  // ===== СЖАТИЕ ДАННЫХ (для клиента) =====
   compressPlayer(player) {
     return {
-      i: player.id,
       x: Math.round(player.x * 100) / 100,
       z: Math.round(player.z * 100) / 100,
-      r: Math.round(player.rotation * 100) / 100,
-      p: Math.round(player.pitch * 100) / 100,
-      h: Math.round(player.health)
+      y: Math.round(player.y * 100) / 100,
+      rotation: Math.round(player.rotation * 100) / 100,
+      pitch: Math.round(player.pitch * 100) / 100,
+      health: Math.round(player.health)
     };
   }
 
@@ -131,15 +131,18 @@ export class GameRoom {
     }
     
     return {
-      p: players,
-      o: this.objects.map(obj => ({
-        i: obj.id,
+      players: players,
+      objects: this.objects.map(obj => ({
+        id: obj.id,
         x: Math.round(obj.x * 100) / 100,
         z: Math.round(obj.z * 100) / 100,
         y: Math.round(obj.y * 100) / 100,
-        h: Math.round(obj.h * 10) / 10
+        h: Math.round(obj.h * 10) / 10,
+        w: Math.round(obj.w * 10) / 10,
+        d: Math.round(obj.d * 10) / 10,
+        color: obj.color
       })),
-      t: Date.now()
+      timestamp: Date.now()
     };
   }
 
@@ -155,6 +158,7 @@ export class GameRoom {
     const [client, server] = Object.values(pair);
     this.ctx.acceptWebSocket(server);
     
+    // Создаем игрока
     const playerId = crypto.randomUUID();
     const startX = (Math.random() - 0.5) * 10;
     const startZ = (Math.random() - 0.5) * 10;
@@ -173,15 +177,8 @@ export class GameRoom {
       lastUpdate: Date.now(),
       lastActivity: Date.now(),
       wsConnected: true,
-      // Для интерполяции на клиенте
-      prevX: startX,
-      prevZ: startZ,
-      prevRotation: 0,
-      prevPitch: 0,
-      lastInterpolation: Date.now(),
-      // Валидация движения
-      serverX: startX,
-      serverZ: startZ
+      isMoving: false,
+      speed: 0
     };
     
     this.players.set(playerId, player);
@@ -197,17 +194,18 @@ export class GameRoom {
     
     await this.saveState();
     
-    // ИНИЦИАЛИЗАЦИЯ (сжатая)
+    // ОТПРАВКА INIT (как ждет клиент)
     const initData = {
-      t: 'init',
-      id: playerId,
-      state: this.compressState(),
-      cfg: {
+      type: 'init',
+      playerId: playerId,
+      players: Object.fromEntries(this.players),
+      objects: this.objects,
+      config: {
         tickRate: this.config.tickRate,
-        interpolationDelay: this.config.interpolationDelay,
+        interpolationDelay: 80,
         moveThreshold: this.config.moveThreshold
       },
-      time: Date.now()
+      serverTime: Date.now()
     };
     
     server.send(JSON.stringify(initData));
@@ -240,7 +238,10 @@ export class GameRoom {
       wsData.lastActivity = now;
       player.lastActivity = now;
       
-      switch (data.t || data.type) {
+      // Поддерживаем оба формата (type и t)
+      const type = data.type || data.t;
+      
+      switch (type) {
         case 'ping':
           this.handlePing(ws, player, wsData, now);
           break;
@@ -256,6 +257,9 @@ export class GameRoom {
         case 'chat':
           this.handleChat(player, data, now);
           break;
+          
+        default:
+          console.warn(`[WebSocket] Unknown type: ${type}`);
       }
       
     } catch (error) {
@@ -263,87 +267,103 @@ export class GameRoom {
     }
   }
 
-  // ===== ОПТИМИЗИРОВАННЫЙ MOVE =====
+  // ===== PING =====
+  handlePing(ws, player, wsData, now) {
+    const ping = now - (wsData.lastPingTime || now);
+    player.ping = Math.min(ping, 500);
+    
+    ws.send(JSON.stringify({
+      type: 'pong',
+      ping: player.ping,
+      timestamp: now,
+      serverTime: now
+    }));
+    
+    wsData.lastPingTime = now;
+  }
+
+  // ===== MOVE (оптимизированный) =====
   handleMove(player, data, now) {
     const deltaTime = Math.min((now - player.lastMoveTime) / 1000, 0.05);
     player.lastMoveTime = now;
     
-    // Проверяем, есть ли изменения
-    const dx = (data.x || 0) - player.x;
-    const dz = (data.z || 0) - player.z;
-    const distance = Math.sqrt(dx*dx + dz*dz);
+    let hasChanges = false;
+    const changes = { id: player.id };
     
-    // Игнорируем слишком маленькие движения (0.05 вместо 0.001)
-    if (distance < this.config.moveThreshold) {
-      return;
-    }
-    
-    // АВТОРИЗАЦИЯ движения (защита от читов)
-    const maxSpeed = this.config.maxSpeed * deltaTime;
-    if (distance > maxSpeed + 1) {
-      // Подозрительное движение - телепорт
-      console.warn(`[AntiCheat] Player ${player.id} moved too fast: ${distance}`);
-      // Отправляем корректную позицию
-      ws.send(JSON.stringify({
-        t: 'teleport',
-        x: player.x,
-        z: player.z
-      }));
-      return;
-    }
-    
-    // Сохраняем предыдущую позицию для интерполяции
-    player.prevX = player.x;
-    player.prevZ = player.z;
-    player.prevRotation = player.rotation || 0;
-    player.prevPitch = player.pitch || 0;
-    player.lastInterpolation = now;
-    
-    // Применяем движение
+    // Проверяем позицию
     if (data.x !== undefined && data.z !== undefined) {
       const newX = Math.max(-30, Math.min(30, data.x));
       const newZ = Math.max(-30, Math.min(30, data.z));
       
-      player.x = newX;
-      player.z = newZ;
-      player.isMoving = distance > 0.01;
-      player.speed = distance / deltaTime;
+      const dx = newX - player.x;
+      const dz = newZ - player.z;
+      const distance = Math.sqrt(dx*dx + dz*dz);
+      
+      // Анти-чит: проверка скорости
+      const maxSpeed = this.config.maxSpeed * deltaTime + 0.5;
+      
+      if (distance < maxSpeed) {
+        player.x = newX;
+        player.z = newZ;
+        player.isMoving = distance > 0.01;
+        player.speed = distance / deltaTime;
+        
+        changes.x = player.x;
+        changes.z = player.z;
+        hasChanges = true;
+      } else if (distance > 1) {
+        // Подозрительное движение - телепорт обратно
+        console.warn(`[AntiCheat] Player ${player.id} moved too fast: ${distance}`);
+        ws.send(JSON.stringify({
+          type: 'teleport',
+          x: player.x,
+          z: player.z
+        }));
+        return;
+      }
     }
     
+    // Повороты
     if (data.rotation !== undefined) {
       player.rotation = data.rotation;
+      changes.rotation = player.rotation;
+      hasChanges = true;
     }
     
     if (data.pitch !== undefined) {
       player.pitch = Math.max(-Math.PI/2, Math.min(Math.PI/2, data.pitch));
+      changes.pitch = player.pitch;
+      hasChanges = true;
     }
     
     player.lastUpdate = now;
     player.wsConnected = true;
     
-    // Добавляем в БУФЕР ДВИЖЕНИЙ (высокий приоритет)
-    this.moveBuffer.push({
-      id: player.id,
-      x: player.x,
-      z: player.z,
-      r: player.rotation,
-      p: player.pitch,
-      time: now
-    });
-    
-    // Ограничиваем размер буфера
-    if (this.moveBuffer.length > 50) {
-      this.moveBuffer = this.moveBuffer.slice(-30);
+    // Добавляем в буфер только если есть изменения
+    if (hasChanges) {
+      this.moveBuffer.push({
+        id: player.id,
+        x: player.x,
+        z: player.z,
+        rotation: player.rotation,
+        pitch: player.pitch,
+        time: now
+      });
+      
+      // Ограничиваем буфер
+      if (this.moveBuffer.length > 100) {
+        this.moveBuffer = this.moveBuffer.slice(-50);
+      }
     }
   }
 
-  // ===== СТРЕЛЬБА =====
+  // ===== SHOOT =====
   handleShoot(player, data, now) {
     const cooldown = 100;
     if (now - (player.lastShootTime || 0) < cooldown) return;
     player.lastShootTime = now;
     
-    // Простая проверка попадания
+    // Проверка попадания
     const rayX = player.x + Math.sin(player.rotation || 0) * 3;
     const rayZ = player.z + Math.cos(player.rotation || 0) * 3;
     
@@ -358,7 +378,13 @@ export class GameRoom {
       if (distance < 2 && obj.h > 0) {
         hit = true;
         obj.h = Math.max(0, obj.h - 0.5);
-        hitObjects.push({ id: obj.id, h: obj.h });
+        hitObjects.push({
+          id: obj.id,
+          h: obj.h,
+          x: obj.x,
+          z: obj.z,
+          y: obj.y
+        });
       }
     }
     
@@ -366,11 +392,12 @@ export class GameRoom {
     
     // Отправляем результат
     this.broadcast({
-      t: 'shoot',
-      id: player.id,
+      type: 'shoot_result',
+      playerId: player.id,
       hit: hit,
+      position: { x: player.x, z: player.z },
       objects: hitObjects,
-      time: now
+      timestamp: now
     });
     
     if (hitObjects.length > 0) {
@@ -378,28 +405,16 @@ export class GameRoom {
     }
   }
 
+  // ===== CHAT =====
   handleChat(player, data, now) {
     const name = player.id.slice(0, 6);
     this.broadcast({
-      t: 'chat',
+      type: 'chat',
       id: player.id,
       name: name,
       text: (data.text || '').substring(0, 100),
-      time: now
+      timestamp: now
     });
-  }
-
-  handlePing(ws, player, wsData, now) {
-    const ping = now - (wsData.lastPingTime || now);
-    player.ping = Math.min(ping, 500);
-    
-    ws.send(JSON.stringify({
-      t: 'pong',
-      ping: player.ping,
-      time: now
-    }));
-    
-    wsData.lastPingTime = now;
   }
 
   // ===== BROADCAST =====
@@ -424,55 +439,75 @@ export class GameRoom {
       this.lastTickTime = now;
     }
     
-    // 1. Отправляем ДВИЖЕНИЯ (каждый тик, высокий приоритет)
+    // 1. Отправка ДЕЛЬТА-ОБНОВЛЕНИЙ (движения)
     if (this.moveBuffer.length > 0) {
       const moves = this.moveBuffer.splice(0, this.moveBuffer.length);
       
       // Группируем по игрокам (берем последнее значение)
       const grouped = {};
       for (const move of moves) {
-        grouped[move.id] = {
-          id: move.id,
-          x: move.x,
-          z: move.z,
-          r: move.r,
-          p: move.p
-        };
+        if (!grouped[move.id] || move.time > grouped[move.id].time) {
+          grouped[move.id] = {
+            id: move.id,
+            x: move.x,
+            z: move.z,
+            rotation: move.rotation,
+            pitch: move.pitch
+          };
+        }
       }
       
+      // Отправляем как delta (клиент ждет такой формат)
       this.broadcast({
-        t: 'delta',
-        players: Object.values(grouped),
-        time: now
+        type: 'delta',
+        players: grouped,
+        objects: [],
+        tps: this.currentTPS,
+        timestamp: now,
+        serverTime: now
       });
     }
     
-    // 2. Отправляем СНАПШОТЫ (каждые 200ms, полное состояние)
+    // 2. Отправка СНАПШОТОВ (полное состояние)
     if (now - this.lastSnapshot >= this.config.snapshotInterval) {
+      const state = this.compressState();
       this.broadcast({
-        t: 'snap',
-        state: this.compressState(),
-        time: now
+        type: 'state',
+        players: state.players,
+        objects: state.objects,
+        tps: this.currentTPS,
+        timestamp: now,
+        serverTime: now
       });
       this.lastSnapshot = now;
     }
     
-    // 3. Очистка
+    // 3. Heartbeat
+    if (this.tickCount % Math.round(this.config.tickRate / this.config.heartbeatRate) === 0) {
+      this.broadcast({
+        type: 'heartbeat',
+        timestamp: now,
+        serverTime: now,
+        players: this.players.size
+      });
+    }
+    
+    // 4. Очистка
     if (now - this.lastCleanup > this.config.cleanupInterval) {
       this.cleanupAllPlayers();
       this.lastCleanup = now;
     }
     
-    // 4. Проверка соединений
+    // 5. Проверка соединений
     this.checkConnections();
     
-    // 5. Остановка
+    // 6. Остановка
     if (this.players.size === 0) {
       this.stopGameLoop();
     }
   }
 
-  // ===== ОСТАЛЬНЫЕ МЕТОДЫ =====
+  // ===== ПРОВЕРКА СОЕДИНЕНИЙ =====
   checkConnections() {
     const now = Date.now();
     const timeout = 30000;
@@ -484,22 +519,47 @@ export class GameRoom {
         const wsData = this.wsCache.get(ws);
         if (wsData?.playerId) {
           activePlayers.add(wsData.playerId);
+          
           if (now - wsData.lastActivity > timeout) {
             this.wsCache.delete(ws);
-            ws.close(1000, 'Timeout');
+            ws.close(1000, 'Connection timeout');
           }
         }
       } catch (error) {}
     }
     
+    // Обновляем статус
     for (const [id, player] of this.players) {
-      player.wsConnected = activePlayers.has(id);
-      if (player.wsConnected) {
+      const isActive = activePlayers.has(id);
+      player.wsConnected = isActive;
+      
+      if (isActive) {
         player.lastUpdate = now;
+      }
+    }
+    
+    // Удаляем неактивных
+    if (this.players.size > activePlayers.size) {
+      const staleTimeout = 10000;
+      const stalePlayers = [];
+      
+      for (const [id, player] of this.players) {
+        if (!player.wsConnected && (now - player.lastUpdate > staleTimeout)) {
+          stalePlayers.push(id);
+        }
+      }
+      
+      if (stalePlayers.length > 0) {
+        for (const id of stalePlayers) {
+          this.players.delete(id);
+          this.playerCache.delete(id);
+        }
+        this.saveState();
       }
     }
   }
 
+  // ===== ОЧИСТКА =====
   async cleanupAllPlayers() {
     const now = Date.now();
     const wsSockets = this.ctx.getWebSockets();
@@ -531,11 +591,13 @@ export class GameRoom {
         this.playerCache.delete(id);
       }
       await this.saveState();
+      console.log(`[Cleanup] Removed ${removed.length} players`);
     }
     
     return removed;
   }
 
+  // ===== WEBSOCKET СОБЫТИЯ =====
   webSocketClose(ws) {
     try {
       const wsData = this.wsCache.get(ws);
@@ -544,10 +606,13 @@ export class GameRoom {
         if (player) {
           player.wsConnected = false;
           player.lastUpdate = Date.now();
+          console.log(`[WebSocket] Player ${wsData.playerId} disconnected`);
         }
         this.wsCache.delete(ws);
       }
-    } catch (error) {}
+    } catch (error) {
+      console.error('[WebSocket] Close error:', error);
+    }
     
     setTimeout(() => this.cleanupAllPlayers(), 1000);
   }
@@ -569,13 +634,14 @@ export class GameRoom {
       if (url.pathname === '/reset') {
         this.players.clear();
         await this.saveState();
-        const wsSockets = this.ctx.getWebSockets();
-        for (const ws of wsSockets) {
+        for (const ws of this.ctx.getWebSockets()) {
           try { ws.close(1000, 'Reset'); } catch (e) {}
         }
         this.stopGameLoop();
         this.startGameLoop();
-        return new Response(JSON.stringify({ success: true }));
+        return new Response(JSON.stringify({ success: true }), {
+          headers: { 'Content-Type': 'application/json' }
+        });
       }
       
       if (url.pathname === '/stats') {
@@ -585,10 +651,25 @@ export class GameRoom {
           objects: this.objects.length,
           wsConnections: this.ctx.getWebSockets().length,
           avgPing: Array.from(this.players.values()).reduce((a, p) => a + p.ping, 0) / (this.players.size || 1)
-        }), { headers: { 'Content-Type': 'application/json' } });
+        }), {
+          headers: { 'Content-Type': 'application/json' }
+        });
       }
       
-      return new Response('Not found', { status: 404 });
+      if (url.pathname === '/debug') {
+        return new Response(JSON.stringify({
+          players: Array.from(this.players.keys()),
+          wsConnections: this.ctx.getWebSockets().length,
+          objects: this.objects.length,
+          tickInterval: !!this.tickInterval,
+          currentTPS: this.currentTPS,
+          moveBuffer: this.moveBuffer.length
+        }), {
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+      
+      return new Response('Game Server Running', { status: 200 });
     } catch (error) {
       console.error('[HTTP] Error:', error);
       return new Response('Error', { status: 500 });
@@ -599,7 +680,17 @@ export class GameRoom {
 // ===== WORKER =====
 export default {
   async fetch(request, env) {
+    const url = new URL(request.url);
+    
     try {
+      // Корневой путь
+      if (url.pathname === '/' || url.pathname === '') {
+        return new Response('DO Shooter Server Running', {
+          status: 200,
+          headers: { 'Content-Type': 'text/plain' }
+        });
+      }
+      
       const id = env.GAME_ROOM.idFromName('main');
       const room = env.GAME_ROOM.get(id);
       return room.fetch(request);
