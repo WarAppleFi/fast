@@ -11,5 +11,10 @@ bindings = [
 tag = "v1"
 new_classes = ["GameRoom"]
 
+# Опционально: настройки для production
 [env.production]
 vars = { ENVIRONMENT = "production" }
+
+# Опционально: настройки для development
+[env.development]
+vars = { ENVIRONMENT = "development" }
