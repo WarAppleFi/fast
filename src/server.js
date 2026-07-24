@@ -16,19 +16,21 @@ export class GameRoom {
     this.lastCleanupTime = Date.now();
     this.isInitialized = false;
     
+    // Храним последнее состояние для отправки
+    this.lastState = null;
+    this.lastStateHash = '';
+    
     this.initialize();
   }
 
   async initialize() {
-    // Проверяем, не инициализирован ли уже
     if (this.isInitialized) return;
     this.isInitialized = true;
     
     const saved = await this.storage.get('state');
     if (saved) {
-      // Загружаем только объекты, игроков сбрасываем при инициализации
       this.objects = saved.objects || [];
-      this.players = {}; // Всегда очищаем игроков при старте
+      this.players = {};
       
       console.log('Initialized with', this.objects.length, 'objects, players cleared');
       await this.storage.put('state', {
@@ -36,7 +38,6 @@ export class GameRoom {
         objects: this.objects
       });
     } else {
-      // Создаем объекты только если их нет
       for (let i = 0; i < 20; i++) {
         this.objects.push({
           id: i,
@@ -59,7 +60,6 @@ export class GameRoom {
   async fetch(request) {
     const url = new URL(request.url);
     
-    // Добавляем эндпоинт для полной очистки
     if (url.pathname === '/reset') {
       this.players = {};
       await this.storage.put('state', {
@@ -67,7 +67,6 @@ export class GameRoom {
         objects: this.objects
       });
       
-      // Закрываем все вебсокеты
       this.ctx.getWebSockets().forEach(ws => {
         try {
           ws.close(1000, 'Server reset');
@@ -90,7 +89,6 @@ export class GameRoom {
     }
     
     if (url.pathname === '/ws') {
-      // При новом подключении проверяем и очищаем старых игроков
       await this.cleanupAllPlayers();
       
       const pair = new WebSocketPair();
@@ -115,7 +113,12 @@ export class GameRoom {
         connectedAt: Date.now(),
         lastUpdate: Date.now(),
         wsConnected: true,
-        wsId: Math.random().toString(36).substring(7)
+        wsId: Math.random().toString(36).substring(7),
+        // Добавляем флаги для анимации
+        isMoving: false,
+        targetX: startX,
+        targetZ: startZ,
+        moveSpeed: 0
       };
       
       await this.storage.put('state', {
@@ -165,7 +168,8 @@ export class GameRoom {
             ping: player.ping,
             lastUpdate: Math.floor((now - player.lastUpdate) / 1000) + 's ago',
             wsConnected: player.wsConnected || false,
-            wsId: player.wsId
+            wsId: player.wsId,
+            isMoving: player.isMoving || false
           };
         })
       }), {
@@ -190,7 +194,6 @@ export class GameRoom {
     const now = Date.now();
     const removed = [];
     
-    // Получаем все активные вебсокеты
     const wsSockets = this.ctx.getWebSockets();
     const activePlayerIds = new Set();
     
@@ -203,10 +206,9 @@ export class GameRoom {
       } catch(e) {}
     });
     
-    // Удаляем всех игроков, у которых нет активного вебсокета
     for (const [id, player] of Object.entries(this.players)) {
       const hasWs = activePlayerIds.has(id);
-      const isStale = now - player.lastUpdate > 5000; // 5 секунд без обновления
+      const isStale = now - player.lastUpdate > 5000;
       
       if (!hasWs || isStale) {
         removed.push(id);
@@ -262,9 +264,27 @@ export class GameRoom {
           const deltaTime = Math.min((now - (player.lastMoveTime || now)) / 1000, 0.05);
           player.lastMoveTime = now;
           
+          // Сохраняем старые координаты для определения движения
+          const oldX = player.x;
+          const oldZ = player.z;
+          
           if (data.x !== undefined && data.z !== undefined) {
             player.x = Math.max(-30, Math.min(30, data.x));
             player.z = Math.max(-30, Math.min(30, data.z));
+            
+            // Определяем, двигается ли игрок
+            const dx = player.x - oldX;
+            const dz = player.z - oldZ;
+            const distance = Math.sqrt(dx*dx + dz*dz);
+            
+            player.isMoving = distance > 0.01;
+            
+            if (player.isMoving) {
+              // Сохраняем направление движения
+              player.targetX = player.x;
+              player.targetZ = player.z;
+              player.moveSpeed = distance / deltaTime;
+            }
           }
           
           if (data.rotation !== undefined) {
@@ -316,6 +336,7 @@ export class GameRoom {
           break;
       }
       
+      // Сохраняем состояние после каждого обновления
       await this.storage.put('state', {
         players: this.players,
         objects: this.objects
@@ -337,12 +358,15 @@ export class GameRoom {
       this.lastTickTime = now;
     }
     
-    // Каждые 30 тиков делаем очистку
+    // Очистка каждые 30 тиков
     if (this.tickCount % 30 === 0) {
       this.cleanupAllPlayers();
     }
     
-    // Отправляем состояние всем игрокам
+    // ----- ВАЖНО: ПРИНУДИТЕЛЬНОЕ ОБНОВЛЕНИЕ СОСТОЯНИЯ -----
+    // Отправляем состояние ВСЕМ игрокам в КАЖДОМ тике
+    // Даже если данные не изменились, это нужно для синхронизации
+    
     const state = {
       type: 'state',
       players: this.players,
@@ -352,28 +376,42 @@ export class GameRoom {
       serverTime: now
     };
     
-    const message = JSON.stringify(state);
-    const sockets = this.ctx.getWebSockets();
+    // Создаем хеш состояния для оптимизации
+    const stateHash = JSON.stringify(state);
     
-    const activePlayerIds = new Set();
-    sockets.forEach((ws) => {
-      try {
-        const attachment = ws.deserializeAttachment();
-        if (attachment?.playerId) {
-          activePlayerIds.add(attachment.playerId);
-          ws.send(message);
+    // Отправляем только если состояние изменилось или прошло больше 100мс
+    if (stateHash !== this.lastStateHash || now - this.lastStateSend > 100) {
+      this.lastStateHash = stateHash;
+      this.lastStateSend = now;
+      
+      const message = JSON.stringify(state);
+      const sockets = this.ctx.getWebSockets();
+      
+      const activePlayerIds = new Set();
+      sockets.forEach((ws) => {
+        try {
+          const attachment = ws.deserializeAttachment();
+          if (attachment?.playerId) {
+            activePlayerIds.add(attachment.playerId);
+            ws.send(message);
+          }
+        } catch(e) {
+          const attachment = ws.deserializeAttachment();
+          if (attachment?.playerId && this.players[attachment.playerId]) {
+            this.players[attachment.playerId].wsConnected = false;
+          }
         }
-      } catch(e) {
-        const attachment = ws.deserializeAttachment();
-        if (attachment?.playerId && this.players[attachment.playerId]) {
-          this.players[attachment.playerId].wsConnected = false;
+      });
+      
+      // Обновляем флаги подключения
+      for (const [id, player] of Object.entries(this.players)) {
+        player.wsConnected = activePlayerIds.has(id);
+        // Если игрок не двигается, но соединен - помечаем как стоящего
+        if (activePlayerIds.has(id) && !player.isMoving) {
+          // Просто обновляем время, чтобы не удалили
+          player.lastUpdate = now;
         }
       }
-    });
-    
-    // Обновляем флаги подключения
-    for (const [id, player] of Object.entries(this.players)) {
-      player.wsConnected = activePlayerIds.has(id);
     }
     
     if (Object.keys(this.players).length === 0) {
@@ -392,7 +430,6 @@ export class GameRoom {
       console.log(`Player ${attachment.playerId} disconnected, marked for cleanup`);
     }
     
-    // Запускаем немедленную очистку
     setTimeout(() => {
       this.cleanupAllPlayers();
     }, 1000);
