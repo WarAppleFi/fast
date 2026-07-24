@@ -1,6 +1,9 @@
 // src/server.js
 import { DurableObject } from 'cloudflare:workers';
 
+// ============================================
+// GAME ROOM - DURABLE OBJECT
+// ============================================
 export class GameRoom extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
@@ -8,20 +11,11 @@ export class GameRoom extends DurableObject {
     this.sessions = new Map();
     this.worldWidth = 800;
     this.worldHeight = 600;
-    this.tickInterval = null;
-    this.lastBroadcast = 0;
-    this.updateCounter = 0;
-    this.initialized = false;
+    this.broadcastInterval = null;
   }
 
   async initialize() {
-    if (this.initialized) return;
-    this.initialized = true;
-    await this.loadState();
-    this.startTicking();
-  }
-
-  async loadState() {
+    // Загружаем сохраненное состояние
     try {
       const stored = await this.ctx.storage.get('state');
       if (stored) {
@@ -32,6 +26,13 @@ export class GameRoom extends DurableObject {
       }
     } catch (e) {
       console.error('[GameRoom] Load error:', e);
+    }
+
+    // Запускаем постоянную рассылку состояний
+    if (!this.broadcastInterval) {
+      this.broadcastInterval = setInterval(() => {
+        this.broadcastState();
+      }, 50); // 20 раз в секунду
     }
   }
 
@@ -48,34 +49,14 @@ export class GameRoom extends DurableObject {
     }
   }
 
-  startTicking() {
-    if (this.tickInterval) {
-      clearInterval(this.tickInterval);
-    }
-    this.tickInterval = setInterval(() => {
-      this.tick();
-    }, 50);
-  }
-
-  tick() {
-    if (this.sessions.size > 0) {
-      this.broadcastState();
-    }
-    
-    this.updateCounter++;
-    if (this.updateCounter % 40 === 0) {
-      this.saveState();
-    }
-  }
-
   broadcastState() {
     if (this.sessions.size === 0) return;
-    
+
     const state = {
       type: 'state',
       players: {}
     };
-    
+
     for (const [id, player] of this.players) {
       state.players[id] = {
         x: player.x,
@@ -85,52 +66,52 @@ export class GameRoom extends DurableObject {
         size: player.size || 30
       };
     }
-    
+
     const msg = JSON.stringify(state);
-    const toRemove = [];
-    
+    const deadSessions = [];
+
     for (const [ws, playerId] of this.sessions) {
       try {
         if (ws.readyState === WebSocket.OPEN) {
           ws.send(msg);
         } else {
-          toRemove.push(ws);
+          deadSessions.push(ws);
         }
       } catch (e) {
-        toRemove.push(ws);
+        deadSessions.push(ws);
       }
     }
-    
-    // Удаляем мертвые соединения
-    for (const ws of toRemove) {
+
+    // Удаляем мертвые сессии
+    for (const ws of deadSessions) {
       const playerId = this.sessions.get(ws);
       if (playerId) {
         this.players.delete(playerId);
         this.sessions.delete(ws);
-        console.log(`[GameRoom] Removed dead connection: ${playerId}`);
+        console.log(`[GameRoom] Removed dead session: ${playerId}`);
       }
     }
   }
 
   async handleWebSocket(ws) {
     await this.initialize();
-    
+
     const playerId = crypto.randomUUID().slice(0, 8);
-    console.log(`[GameRoom] New player: ${playerId}`);
-    
+    console.log(`[GameRoom] New connection: ${playerId}`);
+
     // Создаем игрока
     const player = {
       id: playerId,
-      x: 50 + Math.random() * (this.worldWidth - 100),
-      y: 50 + Math.random() * (this.worldHeight - 100),
+      x: 100 + Math.random() * (this.worldWidth - 200),
+      y: 100 + Math.random() * (this.worldHeight - 200),
       health: 100,
       angle: 0,
       size: 30
     };
-    
+
     this.players.set(playerId, player);
     this.sessions.set(ws, playerId);
-    
+
     // Отправляем инициализацию
     const initMsg = {
       type: 'init',
@@ -146,7 +127,7 @@ export class GameRoom extends DurableObject {
         size: p.size || 30
       }))
     };
-    
+
     try {
       ws.send(JSON.stringify(initMsg));
       console.log(`[GameRoom] Init sent to ${playerId}`);
@@ -156,11 +137,11 @@ export class GameRoom extends DurableObject {
       this.players.delete(playerId);
       return;
     }
-    
+
     // Сразу отправляем состояние всем
     this.broadcastState();
-    
-    // Обработчики сообщений
+
+    // Обработка сообщений
     ws.addEventListener('message', (event) => {
       try {
         const data = JSON.parse(event.data);
@@ -169,14 +150,14 @@ export class GameRoom extends DurableObject {
         console.error('[GameRoom] Message error:', e);
       }
     });
-    
-    ws.addEventListener('close', (event) => {
-      console.log(`[GameRoom] Close event: ${playerId}, code: ${event.code}`);
+
+    ws.addEventListener('close', () => {
+      console.log(`[GameRoom] Connection closed: ${playerId}`);
       this.handleDisconnect(ws, playerId);
     });
-    
-    ws.addEventListener('error', (event) => {
-      console.error(`[GameRoom] Error event: ${playerId}`, event);
+
+    ws.addEventListener('error', (error) => {
+      console.error(`[GameRoom] Connection error: ${playerId}`, error);
       this.handleDisconnect(ws, playerId);
     });
   }
@@ -184,17 +165,18 @@ export class GameRoom extends DurableObject {
   handleMessage(ws, playerId, data) {
     const player = this.players.get(playerId);
     if (!player) return;
-    
+
     if (data.type === 'move') {
-      // Ограничиваем
+      // Ограничиваем движение
       const newX = Math.max(20, Math.min(this.worldWidth - 20, data.x));
       const newY = Math.max(20, Math.min(this.worldHeight - 20, data.y));
-      
+
+      // Обновляем позицию
       player.x = newX;
       player.y = newY;
       player.angle = data.angle || player.angle || 0;
-      
-      // Отправляем подтверждение только этому игроку для отзывчивости
+
+      // Немедленно подтверждаем этому игроку (для отзывчивости)
       const response = {
         type: 'state',
         players: {
@@ -207,16 +189,16 @@ export class GameRoom extends DurableObject {
           }
         }
       };
-      
+
       try {
         if (ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify(response));
         }
       } catch (e) {
-        // Игнорируем
+        // Игнорируем ошибки отправки
       }
     }
-    
+
     if (data.type === 'ping') {
       try {
         if (ws.readyState === WebSocket.OPEN) {
@@ -229,13 +211,10 @@ export class GameRoom extends DurableObject {
   }
 
   handleDisconnect(ws, playerId) {
-    console.log(`[GameRoom] Disconnect: ${playerId}`);
-    
-    const exists = this.sessions.has(ws);
-    if (exists) {
+    if (this.sessions.has(ws)) {
       this.sessions.delete(ws);
     }
-    
+
     if (this.players.has(playerId)) {
       this.players.delete(playerId);
       this.saveState();
@@ -245,29 +224,32 @@ export class GameRoom extends DurableObject {
   }
 }
 
-// ============ WORKER ============
+// ============================================
+// WORKER
+// ============================================
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    
+
+    // WebSocket endpoint
     if (url.pathname === '/') {
       const upgradeHeader = request.headers.get('Upgrade');
       if (!upgradeHeader || upgradeHeader !== 'websocket') {
         return new Response('WebSocket required', { status: 400 });
       }
-      
+
       try {
         // Создаем WebSocket пару
         const pair = new WebSocketPair();
         const [client, server] = Object.values(pair);
-        
+
         // Получаем Durable Object
         const id = env.GAME.idFromName('main');
         const gameRoom = env.GAME.get(id);
-        
-        // Обрабатываем WebSocket
+
+        // Обрабатываем серверный WebSocket
         await gameRoom.handleWebSocket(server);
-        
+
         // Возвращаем клиентский WebSocket
         return new Response(null, {
           status: 101,
@@ -278,7 +260,12 @@ export default {
         return new Response('WebSocket error', { status: 500 });
       }
     }
-    
+
+    // Health check
+    if (url.pathname === '/health') {
+      return new Response('OK', { status: 200 });
+    }
+
     return new Response('Not found', { status: 404 });
   }
 };
