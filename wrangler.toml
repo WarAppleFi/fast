@@ -1,6 +1,5 @@
 name = "js-multiplayer-3d"
-type = "webassembly"  # Экспериментальный тип
-main = "src/server.wasm"
+main = "server.js"  # Теперь указываем на обёртку в корне
 compatibility_date = "2024-09-23"
 
 [durable_objects]
@@ -9,3 +8,5 @@ bindings = [{ name = "GAME_ROOM", class_name = "GameRoom" }]
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["GameRoom"]
+
+# Удалите строки с type и main = "src/server.wasm"
