@@ -10,15 +10,9 @@ async function initWasm() {
   }
 
   try {
-    // Инициализируем WASM модуль
-    const imports = {
-      env: {
-        // Здесь можно добавить функции окружения, если нужно
-        // Например, для работы с Durable Objects
-      }
-    };
-
-    const result = await WebAssembly.instantiate(wasm, imports);
+    const result = await WebAssembly.instantiate(wasm, {
+      env: {}
+    });
     wasmInstance = result.instance.exports;
     return wasmInstance;
   } catch (error) {
@@ -27,15 +21,22 @@ async function initWasm() {
   }
 }
 
-// Экспортируем обработчик запросов
+// Экспортируем Durable Object GameRoom из WASM
+export const GameRoom = {
+  async fetch(request, env, ctx) {
+    const wasm = await initWasm();
+    return wasm.GameRoom.fetch(request, env, ctx);
+  },
+  
+  // Если у GameRoom есть другие методы, их тоже нужно экспортировать
+  // Например, если есть метод new() или другие статические методы
+};
+
+// Экспортируем основной обработчик fetch
 export default {
   async fetch(request, env, ctx) {
     try {
-      // Инициализируем WASM
       const wasm = await initWasm();
-      
-      // Вызываем функцию main из Rust кода
-      // Передаём request, env и ctx как аргументы
       return wasm.main(request, env, ctx);
     } catch (error) {
       console.error('Ошибка выполнения Worker:', error);
