@@ -1,5 +1,6 @@
 name = "js-multiplayer-3d"
-main = "server.js"
+type = "rust"
+main = "src/lib.rs"
 compatibility_date = "2024-09-23"
 
 [durable_objects]
