@@ -3,9 +3,15 @@ type = "rust"
 main = "src/lib.rs"
 compatibility_date = "2024-09-23"
 
+[build]
+command = "cargo install -q worker-build && worker-build --release"
+
+[build.upload]
+format = "wasm"
+
 [durable_objects]
 bindings = [{ name = "GAME_ROOM", class_name = "GameRoom" }]
 
 [[migrations]]
 tag = "v1"
-new_sqlite_classes = ["GameRoom"]
+new_classes = ["GameRoom"]  # тоже меняем
