@@ -1,13 +1,12 @@
 {
   "name": "js-multiplayer-3d",
-  "version": "0.1.0",
+  "version": "1.0.0",
+  "private": true,
   "scripts": {
-    "build": "worker-build --release",
-    "deploy": "wrangler deploy",
-    "dev": "wrangler dev"
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
   },
   "devDependencies": {
-    "wrangler": "^4.0.0",
-    "worker-build": "^2.0.0"
+    "wrangler": "^4.114.0"
   }
 }
