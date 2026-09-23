@@ -86,91 +86,6 @@ document.addEventListener('mousemove', (event) => {
   camera.rotation.x = pitch;
 });
 
-// ===== НОВОЕ: Управление геймпадом =====
-let gamepadIndex = null;
-let gamepadConnected = false;
-
-window.addEventListener('gamepadconnected', (event) => {
-  console.log('Геймпад подключен:', event.gamepad.id);
-  gamepadIndex = event.gamepad.index;
-  gamepadConnected = true;
-  
-  // Показываем уведомление о подключении
-  const notification = document.createElement('div');
-  notification.textContent = 'Геймпад подключен!';
-  notification.style.cssText = `
-    position: fixed;
-    top: 20px;
-    left: 50%;
-    transform: translateX(-50%);
-    background: rgba(56, 189, 248, 0.9);
-    color: white;
-    padding: 10px 20px;
-    border-radius: 5px;
-    font-family: Arial, sans-serif;
-    z-index: 1000;
-    animation: fadeOut 3s forwards;
-  `;
-  
-  // Добавляем анимацию исчезновения
-  const style = document.createElement('style');
-  style.textContent = `
-    @keyframes fadeOut {
-      0% { opacity: 1; }
-      70% { opacity: 1; }
-      100% { opacity: 0; }
-    }
-  `;
-  document.head.appendChild(style);
-  
-  document.body.appendChild(notification);
-  setTimeout(() => notification.remove(), 3000);
-});
-
-window.addEventListener('gamepaddisconnected', (event) => {
-  console.log('Геймпад отключен:', event.gamepad.id);
-  if (gamepadIndex === event.gamepad.index) {
-    gamepadIndex = null;
-    gamepadConnected = false;
-  }
-});
-
-function getGamepadInput() {
-  if (!gamepadConnected || gamepadIndex === null) {
-    return { moveX: 0, moveY: 0, lookX: 0, lookY: 0 };
-  }
-  
-  const gamepad = navigator.getGamepads()[gamepadIndex];
-  if (!gamepad) {
-    gamepadConnected = false;
-    gamepadIndex = null;
-    return { moveX: 0, moveY: 0, lookX: 0, lookY: 0 };
-  }
-  
-  // Стандартная раскладка геймпада:
-  // Левый стик (оси 0, 1): движение
-  // Правый стик (оси 2, 3): камера
-  // Кнопка A (0): можно использовать для действий
-  
-  const deadzone = 0.15; // Мёртвая зона для стиков
-  
-  let moveX = gamepad.axes[0] || 0; // Левый стик X
-  let moveY = gamepad.axes[1] || 0; // Левый стик Y
-  
-  let lookX = gamepad.axes[2] || 0; // Правый стик X
-  let lookY = gamepad.axes[3] || 0; // Правый стик Y
-  
-  // Применяем мёртвую зону
-  if (Math.abs(moveX) < deadzone) moveX = 0;
-  if (Math.abs(moveY) < deadzone) moveY = 0;
-  if (Math.abs(lookX) < deadzone) lookX = 0;
-  if (Math.abs(lookY) < deadzone) lookY = 0;
-  
-  return { moveX, moveY, lookX, lookY };
-}
-
-// ==========================================
-
 window.addEventListener('resize', () => {
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
@@ -263,34 +178,10 @@ function animate(now) {
   const forward = new THREE.Vector3(Math.sin(yaw), 0, Math.cos(yaw));
   const right = new THREE.Vector3(Math.cos(yaw), 0, -Math.sin(yaw));
 
-  // Обработка клавиатуры
   if (moveForward) direction.add(forward);
   if (moveBackward) direction.sub(forward);
   if (moveLeft) direction.sub(right);
   if (moveRight) direction.add(right);
-
-  // ===== НОВОЕ: Обработка геймпада =====
-  const gamepadInput = getGamepadInput();
-  
-  // Движение от геймпада (левый стик)
-  if (gamepadInput.moveX !== 0 || gamepadInput.moveY !== 0) {
-    // Инвертируем Y, так как вверх на стике это отрицательное значение
-    const gamepadMoveX = -gamepadInput.moveX;
-    const gamepadMoveY = -gamepadInput.moveY;
-    
-    direction.x += gamepadMoveX * right.x + gamepadMoveY * forward.x;
-    direction.z += gamepadMoveX * right.z + gamepadMoveY * forward.z;
-  }
-  
-  // Поворот камеры от геймпада (правый стик)
-  if (gamepadInput.lookX !== 0 || gamepadInput.lookY !== 0) {
-    const lookSpeed = 2.0 * delta; // Скорость поворота камеры
-    yaw -= gamepadInput.lookX * lookSpeed;
-    pitch = Math.max(-1.2, Math.min(1.2, pitch - gamepadInput.lookY * lookSpeed));
-    playerGroup.rotation.y = yaw;
-    camera.rotation.x = pitch;
-  }
-  // ==========================================
 
   if (direction.lengthSq() > 0) {
     direction.normalize().multiplyScalar(moveSpeed);
